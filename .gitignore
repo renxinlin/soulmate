@@ -32,6 +32,11 @@ Thumbs.db
 *.onnx
 *.wav
 
+# Large data files (>1MB)
+MeloTTS/melo/text/fr_phonemizer/example_ipa.txt
+MeloTTS/melo/text/cmudict.rep
+com/robot/models/tts/get-pip.py
+
 # Debug / temp output
 _dbg*.txt
 _demo_out.txt
