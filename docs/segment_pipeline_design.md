@@ -79,6 +79,16 @@ R7-b  未消费     ：S ≥ D            （新段，排除重复派发）
 R7-c  最短语音   ：E − S ≥ 300ms    （即 R6 的"长声音 ≥ 0.3"）
 ```
 
+**三条落地约定（实现期补记，代码里都有对应断言/测试）**
+
+1. **空闲时 `D` 跟随 `C`**：IDLE 且无候选时没有任何待派发音频，`D` 若原地不动，`W − D`
+   会随静音一直涨，几秒后误触 E5 缓冲压力、把「没说的话」当溢出音频告警（TC1）。
+2. **派发边界对齐到 VAD 帧栅格**（`grid0 + k·block_ms`）：`start − pre_roll` 通常落在帧中间，
+   直接按毫秒切会把一个判决帧的音频劈开，回放时表现为「段首缺一块」。对齐方向：起点向下取整
+   （只多给 pre_roll，不少给），终点向下取整但不早于尾点（TC3/TC7/TC15）。
+3. **同句续段不得与上一段重叠**：`seq_in_utterance > 0` 的段，其 pre_roll 区间已经被上一段派发过，
+   再叠一次会让下游把同 200 ms 识别两遍（表现为重复字），故续段起点直接取 `D`（TC4）。
+
 **"长声音" 定义**：连续非静音帧构成的一段候选（candidate segment）。R6 中"没有长声音"= 当前无候选；"长声音小于 0.3"= 候选时长 < `min_speech_ms`，判为抖动/瞬态噪声，丢弃。
 
 **"滑动窗口 2 秒" 的定位（R2 二义性，见 §7-G4）**
@@ -181,47 +191,60 @@ class Segment:
 ## 4. 参数表（集中配置，单位统一 ms / dB）
 
 ```python
-# com/robot/segment/config.py
+# com/robot/segment/config.py（与落库实现一致）
 
 @dataclass
 class SegmentConfig:
     # ---- 采集 ----
     sample_rate: int = 16000
+    channels: int = 1                  # 仅 mono（见 §7-G18）
     block_ms: int = 32                 # 采集块 = VAD 帧（512 样本 @16k）
-    ring_capacity_ms: int = 8000       # ⚠ 见 §7-G5：6000ms 余量仅 200ms
+    ring_capacity_ms: int = 8192       # ⚠ 6000 在本参数集下不成立，见 §7-G5
 
     # ---- 游标 ----
-    vad_lag_ms: int = 500              # R1
+    vad_lag_ms: int = 500              # R1；且必须 ≥ 批量型 VAD 的 lag_ms（见 §7-G19）
     hard_margin_ms: int = 500          # I2 保护带
 
-    # ---- 判决窗 ----
-    stat_window_ms: int = 2000         # R2（统计窗，非触发窗）
-    stat_stride_ms: int = 32           # = block_ms → 窗连续滑动，零额外延迟
+    # ---- 判决窗（R2 读法 A：统计窗，不用于触发；按帧连续滑动）----
+    stat_window_ms: int = 2000
 
-    # ---- 帧级阈值（双阈值迟滞）----
-    prob_start: float = 0.55           # p ≥ 此值 → 可能起口
-    prob_end: float = 0.35             # p < 此值 → 可能收尾（< prob_start，形成 hysteresis）
+    # ---- 帧级阈值（双阈值迟滞，见 §7-G13 的实现口径）----
+    prob_start: float = 0.55           # IDLE 侧：p ≥ 此值才可能起口
+    prob_end: float = 0.35             # SPEAKING 侧：p < 此值才算静音（中间带不推进静音计时）
     confirm_frames: int = 6            # 连续 6 帧（~192ms）过 prob_start 才认定 onset
 
     # ---- 段长度约束 ----
     min_speech_ms: int = 300           # R6 / R7-c
     min_silence_ms: int = 300          # R4（建议 500~650，见 §7-G1）
-    long_silence_ms: int = 650         # 二次静音：确认句末（见 §7-G2）
+    long_silence_ms: int = 650         # 二次静音：确认句末（仅 emit_partial 模式生效，见 §7-G2）
     gap_merge_ms: int = 200            # 短间隙并入同段（见 §7-G6）
+    gap_force_close_ms: int = 200      # 采集空洞 ≥ 此值 → 强制闭合（见 §7-G12）
     max_utterance_ms: int = 5000       # R5
+    cut_search_ms: int = 500           # 截断点择优的回溯窗（见 §5.5）
     pre_roll_ms: int = 200             # 起点向前扩（见 §7-G7）
     post_roll_ms: int = 100
 
-    # ---- 派发 ----
-    dispatch_min_level_db: float = -45.0   # 能量门限，抑制远场底噪（见 §7-G10）
-    partial_at_ms: int = 1200              # §5.7 提前送 partial
-    max_pending_segments: int = 4          # 背压
+    # ---- 能量门限（见 §7-G10 / §7-G20）----
+    dispatch_min_level_db: float = -45.0
+    min_level_over_noise_db: float = 6.0
 
-    # ---- 门控 ----
-    armed: bool = True                 # 唤醒态（见 §7-G8）
-    tts_playing: bool = False          # 自听抑制（见 §7-G9）
-    gate_mode: str = "full_duplex"     # half | full（full 需 AEC）
+    # ---- 派发 ----
+    emit_partial: bool = False         # False = batch（R7 原口径），True = 流式提前送
+    # 队列容量不在这里：QueueDispatcher(maxsize=4)，见 §5.6
+
+    # ---- 启动 / 退出边界（见 §7-G15）----
+    warmup_ms: int = 500
+
+    # ---- 门控默认值（见 §7-G8 / §7-G9）----
+    gate_mode: str = "half"            # half | full（full 需 AEC）；armed/tts_playing 是运行期状态，
+    ignore_during_tts: bool = True     # 归 StaticGate，不放配置里
 ```
+
+> 实现说明：本文早期草稿里写过的 `partial_at_ms`、`armed`、`tts_playing` 三个字段最终没有落进
+> `SegmentConfig`——partial 的触发时刻就是 `min_silence_ms`、final 的确认时刻就是 `long_silence_ms`，
+> 再加一个 `partial_at_ms` 只会造出第三处互相矛盾的静音参数；`armed/tts_playing` 是运行期状态，
+> 由 `StaticGate` 持有（门控与主状态正交，见 §5.1）。`stat_stride_ms` 同样被删掉：统计窗按帧滑动，
+> 步长恒等于 `block_ms`，写成可配参数等于给人一个改了没用的旋钮。
 
 **容量约束（必须作为断言/CI 检查存在）**
 
@@ -316,7 +339,8 @@ R5 只说"截断，状态机为空闲"，未定义三件事，必须补齐：
 
 要点：
 - **D 在拷贝完成后立即前进，绝不等待 ASR 结果**。否则慢 ASR 会把 `D` 拖住，`W − D` 撑爆环形缓冲（§7-G11）。
-- 投递队列有界（`max_pending_segments`）。满时按策略丢弃**最旧**的 `partial` 段、保留 final 段，并记 `backpressure_drop++`。
+- 投递队列有界（`QueueDispatcher(maxsize=…)`，装配时指定，不属于状态机参数）。满时**只挤掉最旧的 partial**、
+  final 从不主动丢弃，并记 `backpressure_drop++`（TC11b 专门验证「丢 partial 保 final」）。
 - `Segment.samples` 是脱离环形缓冲的 `bytes`，下游可安全持有。
 - 派发后保留帧级元数据（`start/end/prob/level`）供 `emotion`、`memory` 与调试使用。
 
@@ -335,7 +359,7 @@ class ISpeechGate(ABC):
 
 ### 5.7 一次性整段 vs 流式 partial（R7 的延迟代价）
 
-R7 要求"一整段话送入后续处理"，即 **batch 模式**：段闭合前一个字节都不送 ASR。代价是首字延迟 = 段长 + 闭合延迟。对话场景建议提供两档，默认 `partial`：
+R7 要求"一整段话送入后续处理"，即 **batch 模式**：段闭合前一个字节都不送 ASR。代价是首字延迟 = 段长 + 闭合延迟。对话场景建议提供两档；**落库默认 batch**（严格照 R7 口径，且不引入重复计算），需要快速反馈时显式开 `emit_partial=True`：
 
 ```
 min_silence_ms 到达 → 送 partial（先出结果，用于快速响应/打断判断）
@@ -343,8 +367,18 @@ long_silence_ms 到达 → 送 final（同 seg_id，下游以 final 覆盖 parti
 ```
 
 `Segment.partial` + `CloseReason` 已覆盖此语义。SenseVoice 离线模式下，`partial` 会重复计算，故**只在需要快速反馈时开启**；纯离线 ASR 走 batch。
+两条实现细节（§8 TC11b/TC13 覆盖）：partial **不推进 `D`**（final 会以更宽区间重读并覆盖同一 `seg_id`）；
+发出 partial 后若用户又接着说，状态机必须**留在 SPEAKING**，`long_silence_ms` 才是真正的句末。
 
 ### 5.8 参考实现（帧循环骨架）
+
+> 下面是**设计期骨架**，用于对照 §5.3 转移表；落库实现见 `com/robot/segment/engine.py`，
+> 与骨架有四处有意的差别：
+> ① `speech` 按状态取阈值（`IDLE` 用 `prob_start`、`SPEAKING` 用 `prob_end`，§7-G13）；
+> ② 事件顺序严格按 §5.4（`E5 > E4 > E3 > E6 > E2 > E1`），骨架里放在最后的 `RING_PRESSURE`
+> 实际上在函数入口先判；
+> ③ 派发边界对齐帧栅格、同句续段不重叠、空闲时 `D` 跟随 `C`（§2 三条落地约定）；
+> ④ 截断后不是直接丢弃剩余音频，而是用 `cut` 之后的帧重建候选并归入同一 `utterance_id`（§5.5）。
 
 ```python
 # com/robot/segment/engine.py（骨架，逻辑与 §5.3 转移表一一对应）
@@ -402,14 +436,24 @@ def step(self, frame: AudioFrame) -> None:
 ## 6. 时序与延迟预算
 
 ```
-帧级判决粒度      = block_ms                  ≈ 32 ms
-起口延迟(onset)   = vad_lag + min_speech + confirm_frames*block
-                  =   500   +    300     +      6×32            ≈ 992 ms
-闭合延迟(offset)  = vad_lag + min_silence     = 500 + 300        = 800 ms
-硬截断延迟        = vad_lag + (max_utterance) = 500 + 5000       = 5500 ms（上界）
-端到端(闭→文本)   = offset 800 + ASR(SenseVoice RTF≈0.1 × 段长)
+帧级判决粒度      = block_ms                  = 32 ms
+起口延迟(onset)   = vad_lag + ceil(min_speech / block) × block
+                  =   500   +      ceil(300/32)×32 = 320  = 820 ms
+闭合延迟(offset)  = vad_lag + ceil(min_silence / block) × block = 500 + 320 = 820 ms
+                  （emit_partial 时 final 用 long_silence=650 → 672 → 1172 ms；partial 仍 820 ms）
+硬截断延迟        = vad_lag + max_utterance             = 500 + 5000 = 5500 ms（上界）
+端到端(闭→文本)   = offset 820 + ASR(SenseVoice RTF≈0.1 × 段长)
                   段长 3s → ≈ 1.1 s；段长 5s → ≈ 1.3 s
 ```
+
+`SegmentConfig.latency_budget()` 直接返回上面三个数（820 / 820 / 5500），CI 用例
+`test_latency_budget_matches_doc` 把它们钉死，改参数时文档与代码不会各说各话。
+
+> 订正：早期版本把 onset 写成 `vad_lag + min_speech + confirm_frames×block ≈ 992 ms`，这里
+> `confirm_frames` 被重复计算了——`confirm_frames×block = 192 ms` 的连续起口帧**本来就在**
+> `min_speech = 300 ms` 的窗口里数完，不是串联关系。只有当 `confirm_frames×block_ms > min_speech_ms`
+> 时起口才由确认帧决定，而那已经是配错参数（`validate()` 会直接拒绝，见 §4 与 TC2 的守卫）。
+> 实测值见 §8：TC7 的 onset = 320 ms（未叠加 lag 的逐帧驱动），`latency_budget()` 即按上式返回。
 
 结论：
 - 起口反馈 1 s、出文本 ~1.3 s，对"陪伴机器人"**可接受但不宽裕**。若要更敏捷，唯一有效手段是 §5.7 的 partial（可把出文本推到 ~0.6 s），而不是压缩 `min_silence`（会更碎）。
@@ -433,7 +477,7 @@ def step(self, frame: AudioFrame) -> None:
 
 ### G4 — R2「滑动窗口 2 秒」语义未定义，两种读法延迟差 1 秒以上【高】
 读法 A（统计/平滑窗）→ 零额外延迟；读法 B（每 2 s 整体判决）→ 起口延迟 ~2.2 s。
-**补全**：明确取 A，`stat_stride_ms = block_ms` 连续滑动。若坚持 B 的抗误触发能力，折中为「帧级触发 + 2 s 窗二次确认」，但二次确认必须与触发并行、不得阻塞 onset。
+**补全**：明确取 A，统计窗按帧（`block_ms`）连续滑动即可，不需要独立步长参数（早期草案里的 `stat_stride_ms` 已删——它等于给了一个改了没用的旋钮）。若坚持 B 的抗误触发能力，折中为「帧级触发 + 2 s 窗二次确认」，但二次确认必须与触发并行、不得阻塞 onset。
 
 ### G5 — 6 s 缓冲与 5 s 上限 + 0.5 s 滞后的余量算紧【高，量化】
 `5000 + 500 + 200 + 100 + 500 = 6300 > 6000`。§4 断言不成立。
@@ -445,7 +489,11 @@ R6/R7 以"连续非静音"定义段，但 VAD 帧概率必然有瞬时跌破，�
 
 ### G7 — 缺 pre-roll，起始辅音/vowel onset 会被吃掉【高】
 VAD 需要 `confirm_frames` 才认定起口，段起点若取"判决时刻"，实际语音前 ~200 ms 已丢失，表现为首字缺声、ASR 漏字。
-**补全**：`pre_roll_ms = 200`（≤ `vad_lag` 的 1/2，缓冲内可得），`post_roll_ms = 100`。R1 的 0.5 s 滞后正好为此提供空间 —— 这也是"游标滞后 0.5 s"真正的价值，应在文档中写明。
+**补全**：`pre_roll_ms = 200`、`post_roll_ms = 100`，派发时从环形缓冲的历史区间取。
+**订正（实现期）**：pre-roll 的来源是**环形缓冲保留的历史深度**（`capacity ≫ pre_roll`，且约束不等式已保证
+`W − D ≤ capacity`），与 `vad_lag` 无关——本文早期版本写作"R1 的 0.5 s 滞后正好为此提供空间"，该论断不成立，
+已在 §2 落地约定中改正。`vad_lag_ms` 的真实作用是两条：① 只对**已完整提交**的帧做判决（I1 的前提）；
+② 覆盖批量型 VAD 的判决步进（见 §7-G19）。pre-roll 必须 ≤ 缓冲保留长度，否则读出 `CLAMPED` 补零音频。
 
 ### G8 — 没有唤醒门控，与仓库既定架构脱节【高】
 `readme.md` 明确"唤醒方案[预制关键词，自动唤醒]"，本状态机未接入。空闲态若一直派发，`memory`/LLM 会被环境噪声持续灌入。
@@ -474,6 +522,12 @@ readme 记录的环境是 WSL + pulseaudio 桥接 + pyaudio，overrun 概率不�
 ### G13 — 缺帧级双阈值与迟滞，状态机会在阈值附近抖动【中】
 单一阈值 + 单帧判 → 反复 IDLE↔SPEAKING。
 **补全**：`prob_start / prob_end` 双阈值（§4）+ `confirm_frames` + `gap_merge`。文档同时建议：概率序列进独立环形缓冲，便于回放与阈值调参。
+**实现口径（重要，容易写错）**：迟滞按**状态**取阈值，而不是所有帧用一个阈值——
+`IDLE` 侧起口要求 `prob ≥ prob_start`（进 SPEAKING 要难），
+`SPEAKING` 侧只有 `prob < prob_end` 才算静音（收尾要松），中间带既不另起新段也不推进静音计时（TC21）。
+另有一条约束：VAD 后端自身的时域平滑（能量 VAD 的 release 拖尾）必须**短于 2 帧**。
+若后端拖 100 ms、状态机再等 300 ms，两处判决叠加就等于 400 ms 静音，句间 400 ms 的正常停顿会被并成一句
+（`com/robot/models/asr/asr.py` 的「0.8~1.3 s 才出文字」就是同一类叠加，见 §7-G19）。
 
 ### G14 — 未定义"起点大于游标"的真实所指【高，语义】
 若按 `C` 理解则 R7 永假（§2 已推导）。
@@ -494,6 +548,36 @@ R3 只说"开始启动为空闲"。mic 上电 pop 音、首次噪声底噪未估
 ### G18 — 单通道假设未声明，与多说话人流水线的衔接缺失【低】
 本状态机产出的是**混合音频段**（单通道）。若后续接 DOA/波束形成，段应是"每波束一路"，则状态机需实例化为 M 路。
 **补全**：`SegmentEngine` 设计为**每通道/每波束一个实例**（无内部全局态），由上层 `SpeakerPipeline` 按 `List[Beam]` 扇出；本文档默认 mono 实例。
+
+### G19 — 没有区分两类 VAD 后端，帧概率型与段输出型的延迟口径完全不同【高，实现期必踩】
+状态机的输入是「逐帧语音概率」，但可用后端分两型：
+① **帧概率型**（silero / 能量）：每帧一个 `[0,1]`，与帧时钟严格同步，闭合延迟就等于 `vad_lag + min_silence`；
+② **段输出型**（FunASR `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch`）：一次输入整窗音频，吐**语音段毫秒区间列表**
+（`value=[[start_ms, end_ms]]`，单位是毫秒——`asr.py` 里专门标注过这个坑），它**不给逐帧概率**。
+
+不区分就会出现三件事：
+1. **模型自带尾静音与状态机静音阈值叠加**。FSMN 默认 `max_end_silence_time ≈ 800 ms` 才吐段尾，
+   状态机再等 `min_silence_ms = 300`，真实闭合延迟约 0.8~1.3 s——这正是 `asr.py` 尾注里
+   「说完后约 0.8~1.3 秒出文字」的成因，而不是 ASR 慢。适配器把该值显式记录为
+   `WindowSegmentVad.model_end_silence_ms`，调参时必须知道自己是**在它之外又加了一层**。
+2. **批量判决的固有滞后**。每 `stride` 重算一次整窗，就只能每 `stride` 交付一批帧概率，
+   第 `i` 帧拿到的是 `i − stride + block` 的判决，滞后恒为 `lag_ms = stride_ms − block_ms`
+   （默认 512−32 = 480 ms）。**`vad_lag_ms` 必须 ≥ `lag_ms`**，否则状态机以为的帧时间和概率实际描述的帧不是同一帧，
+   pre/post_roll 与段边界会整体偏移。这一条正好解释了需求里「VAD 游标在写指针前 0.5 秒」与
+   `asr.py` 里 `VAD_STEP_MS = 500` 为什么是同一个数。
+3. **窗尾贴段尾 ≠ 说完了**。段输出型在窗尾仍处语音时必须把窗尾若干帧判为语音（`ongoing_margin_ms`），
+   否则每滑一个窗都会看到一次假收尾（TC20）。
+
+**补全**：`ISegmentVAD.prob(samples) -> float` 统一两型；`WindowSegmentVad` 负责段列表 → 逐帧概率的换算，
+并暴露 `model_calls`（重算次数）与 `lag_ms`（固有滞后）供观测与 §4 不等式校验；冗余计算比 = `window_ms / stride_ms`
+（默认 1984/512 ≈ 3.9×，优于 `asr.py` 的 2.5 s 窗 / 0.5 s 步进 = 5×）。真要再降延迟，只能换流式 VAD，
+调 `min_silence_ms` 无效——那层等待在模型里面。
+
+### G20 — 自适应底噪若把语音帧算进去，连续说话会被自己的电平判成「能量不足」而整段丢弃【高，实测踩到】
+`dispatch_min_level_db` 的自适应项按窗内分位数估计底噪时，若窗内几乎全是语音（例如 5 s 上限内一直在说），
+20 分位数就等于语音电平，门限变成「语音电平 + 6 dB」→ 永远不达标 → 截断后的续段直接消失（TC4 当时就挂在这里）。
+**补全**：底噪**只用 `prob < 0.5` 的非语音帧**估计；窗内非语音帧少于 8 帧视为未收敛，返回默认极小值，
+此时门限退化为静态 `dispatch_min_level_db`（宁可用静态门限，也不要用被语音污染的自适应值）（TC14b）。
 
 ---
 
@@ -530,6 +614,23 @@ R3 只说"开始启动为空闲"。mic 上电 pop 音、首次噪声底噪未估
 | TC11 | 消费队列塞满 | `D` 仍前进、无异常、`backpressure_drop++`（G11） |
 | TC12 | `ring_capacity=6000, max_utterance=5000` | 启动 `assert` 失败（G5） |
 
+实现期新增（同一文件内，逐条对应上面「补全」里立的规矩；`test_segment.py` 共 37 个用例）：
+
+| # | 输入 | 期望 | 覆盖 |
+|---|------|------|------|
+| TC1 补充 | 纯静音 10 s | `D == C`（空闲水位线），且 `RING_PRESSURE == 0` | §2 约定 1 |
+| TC9b/c | 未 armed / `full` 模式 + TTS 播放 | 前者 0 段且 `gate_blocked` 只在开→关计一次；后者照常派发 | G8/G9 |
+| TC11b | 队列 1 格 + `emit_partial` | 被挤掉的是 partial，final 留下 | G11 |
+| TC13 | `emit_partial` 下停顿后又接话说 | 同 `seg_id`，`final.end > partial.end`，之后离开 SPEAKING | §5.7 |
+| TC14/14b | 远场低电平语音 / 窗内几乎全是语音 | 前者被能量门限拦下并 discard；后者底噪仍为 −70 dB 不误伤 | G10/G20 |
+| TC15 | `ring=2048ms` 反复说 4 轮（必然回绕） | 每段 `status=CLEAN` 且首样本时刻 == `start_ms` | §3.1 |
+| TC16 | 混合长序列 | 全程 `D ≤ C ≤ W`、`W − D ≤ capacity`（step 内 assert） | I1/I2 |
+| TC17 | 说话中停止采集 | `flush()` 以 `EOS` 闭合在途段 | G15 |
+| TC18 | `feed()` 全链路（PCM → 能量 VAD → 状态机） | 切出 1 段，边界包住真实说话区间 | §5.8 |
+| TC19 | 段输出型 VAD 适配 | 每帧恰好一个概率，滞后恒为 `stride − block`，模型调用次数 == 批数 | G19 |
+| TC20 | 段尾贴窗 vs 段尾远离窗尾 | 前者窗尾必须为语音，后者必须落到静音 | G19 |
+| TC21 | `SPEAKING` 中跌进 `[prob_end, prob_start)` 中间带 | 不提前闭合；`IDLE` 侧中间带不起口 | G13 |
+
 **调试回放**：帧级 `prob` + 判决 + 段边界落一行 JSONL（`ts, prob, state, action, cand_id`），配合一段 wav 可完整复现任何误触发；`_debug_*.py` 的现有风格可沿用（参考 `com/robot/scheduler/_debug_wheel.py`）。
 
 ---
@@ -539,27 +640,66 @@ R3 只说"开始启动为空闲"。mic 上电 pop 音、首次噪声底噪未估
 ```
 com/robot/segment/
 ├── __init__.py          # re-export SegState / Segment / SegmentEngine / SegmentConfig
-├── config.py            # SegmentConfig + §4 容量断言
-├── models.py            # SegState / CloseReason / SampleStatus / Candidate / Segment
-├── ring.py              # AudioRingBuffer（SPSC，2 的幂掩码）+ 概率环
-├── vad.py               # 帧级 VAD 封装（sherpa-onnx silero / FSMN-VAD），ISegmentVAD
+├── config.py            # SegmentConfig + §4 容量断言 + latency_budget()
+├── models.py            # SegState / CloseReason / SampleStatus / AudioFrame / Candidate / Segment
+├── ring.py              # AudioRingBuffer（SPSC，2 的幂掩码，越界显式报 CLAMPED/dropped）
+├── vad.py               # ISegmentVAD：EnergyVad / ScriptedVad / SherpaSileroVad / WindowSegmentVad
 ├── engine.py            # SegmentEngine：§5.3 转移表的状态机（可逐帧 step() 驱动）
-├── dispatcher.py        # ISegmentDispatcher 实现：有界队列 + 丢弃策略
+├── dispatcher.py        # ISegmentDispatcher：QueueDispatcher（有界 + 丢 partial 保 final）/ CallbackDispatcher
 ├── gate.py              # ISpeechGate：armed / tts_playing / gate_mode
-├── stats.py             # §8 指标聚合
+├── stats.py             # §8 指标聚合 + 非语音帧底噪估计（G20）
 ├── demo.py              # wav → 分段 → 落盘段文件 + 时间轴报告
-└── test_segment.py      # TC1–TC12
+└── test_segment.py      # TC1–TC21（37 个用例，纯标准库）
 
 docs/segment_pipeline_design.md   # 本文档
 ```
+
+核心逻辑只依赖标准库（`dataclasses/abc/array/math/queue/threading/logging`），
+`numpy / funasr / sherpa_onnx` 全部惰性导入，因此状态机在 RK 板子和 CI 上都能直接跑：
+
+```bash
+python -m unittest com.robot.segment.test_segment -v        # 状态机与后端全链路
+python -m com.robot.segment.demo --vad energy in_16k_mono.wav          # 时间轴报告
+python -m com.robot.segment.demo --vad fsmn --out /tmp/seg in_16k_mono.wav   # 需要 funasr
+```
+
+### 9.1 与现有原型 `com/robot/models/asr/asr.py` 的常量对照
+
+`asr.py` 里 `SenseVoice + FSMN-VAD` 的实时链路已经在跑一套**事实上的**分段逻辑，
+本文的状态机是它的显式化，不是另起炉灶。对照关系（改任何一边都要同步另一边）：
+
+| `asr.py` | 值 | 本文 | 值 | 差别 / 为什么改 |
+|----------|----|------|----|------------------|
+| `BUFFER_SECONDS` | 6 s | `ring_capacity_ms` | 8192 ms | 6 s 在 `max_utterance=5000` 下不满足 §4 不等式（G5），6 s 会随机丢字 |
+| `VAD_STEP_MS` | 500 | `WindowSegmentVad.stride_ms` | 512 | 必须落在帧栅格上；`stride − block = 480 ms` 就是 `vad_lag` 该覆盖的固有滞后（G19） |
+| `VAD_WINDOW_SEC` | 2.5 s（每 0.5 s 重算整个窗） | `window_ms` | 1984 | 冗余计算比 5× → 3.9×；且只交付**新增步长**那批帧概率，不再重复判决同一帧 |
+| `SILENCE_PADDING_MS` | 300 | `min_silence_ms` | 300 | 一致。但 FSMN 内部 `max_end_silence_time ≈ 800 ms` 在其**之外**，真实闭合延迟 0.8~1.3 s（G19） |
+| `MIN_SPEECH_SEC` | 0.3 | `min_speech_ms` / R6/R7-c | 300 | 一致 |
+| `MAX_SPEECH_SEC` | 5.0 | `max_utterance_ms` / R5 | 5000 | 一致；本文补了截断点择优与同句归属（§5.5） |
+| `ONGOING_MARGIN_SEC` | 0.25 | `ongoing_margin_ms` | 250 | 一致，但从 `asr.py` 的段列表判读上移到适配器，状态机只看到帧概率 |
+| `parse_vad_result` | 手工解析 `value=[[start,end]]`（毫秒） | `parse_segment_result` + `WindowSegmentVad` | 同单位 | 单位是**毫秒**这个坑保留在注释与 TC19 断言里 |
+| `NEW_SEG_EPS` | 0.10 s（"防重复识别"） | R7-b `S ≥ D` | 精确 | 原型用 100 ms 容差近似「这段是上次之后新出现的」；本文把它变成显式游标，容差不需要了 |
+| `CHUNK_MS` | 100 | `block_ms` | 32 | 100 ms 粒度会让 pre/post_roll（200/100）无法对齐；32 ms = 512 样本 @16k |
+
+`asr.py` 尾注自己写的「每 0.5 s 重算整个 2.5 s 窗口 ≈ 每秒重复计算约 5 倍音频（建议改流式 VAD）」
+与 §7-G4/§7-G19 是同一个问题，两处结论一致。
 
 ---
 
 ## 10. 待确认决策（需要产品/硬件侧回答）
 
 1. 起口/闭合延迟能否接受 ~1 s？若不能，是否启用 §5.7 partial（代价：ASR 重复计算）。
+   —— **现状**：默认 batch；`emit_partial=True` 已可用，`Segment.partial` 与同 `seg_id` 覆盖协议已实现（TC13）。
 2. 硬件是否有 AEC？决定 G9 走 `half` 还是 `full`（影响能否打断机器人说话）。
+   —— **现状**：`gate_mode` 两档都实现了（TC9/TC9c），只等产品确认硬件。
 3. 环形缓冲 8 s（G5 方案①）还是上限降到 4.2 s（方案②）？
+   —— **现状**：按方案①落库（`ring_capacity_ms=8192`），不等式在 `validate()` 里硬校验，配错启动即 `ConfigError`（TC12）。
 4. `min_silence_ms` 是否按 G1 改为 300/650 两级？需要一批真实对话录音做碎片率标定。
+   —— **现状**：两级参数都在（300 闭合 / 650 句末二次确认，后者仅 `emit_partial` 生效）；标定后只需改数值。
 5. 段是否需保留供 `memory`（人物记忆/大事记）二次消费？若需，`Segment.samples` 的落盘/淘汰策略另议。
 6. 唤醒态（G8）与 `emotion` 模块的关系：armed 期间是否受"情绪"影响主动发言阈值？（属跨模块设计，本文不解决。）
+7. **VAD 后端选哪个**（新增，实现期发现）：帧概率型（sherpa-onnx silero，需 `.onnx` 模型 + RKNN 适配）
+   还是段输出型（FunASR FSMN，仓库现有链路在用）。二者都能接 `ISegmentVAD`，但延迟口径不同：
+   FSMN 的 `≈800 ms` 内部尾静音叠加在状态机之外（§7-G19），silero 没有这一层。
+   若继续用 FSMN，`asr.py` 里「建议改流式 VAD」这条 TODO 就是本模块的下一步；若换 silero，
+   需要确认 RK35xx 上的推理耗时预算（readme 记的是 SenseVoice 已占 CPU/NN 口）。
