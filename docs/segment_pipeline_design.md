@@ -648,20 +648,56 @@ com/robot/segment/
 ├── dispatcher.py        # ISegmentDispatcher：QueueDispatcher（有界 + 丢 partial 保 final）/ CallbackDispatcher
 ├── gate.py              # ISpeechGate：armed / tts_playing / gate_mode
 ├── stats.py             # §8 指标聚合 + 非语音帧底噪估计（G20）
-├── demo.py              # wav → 分段 → 落盘段文件 + 时间轴报告
+├── demo.py              # 离线回放：wav → 分段 → 落盘段文件 + 时间轴报告
+├── demo2.py             # 实时采集：麦克风(1/多通道) → 重采样/下混 → 分段
 └── test_segment.py      # TC1–TC21（37 个用例，纯标准库）
 
 docs/segment_pipeline_design.md   # 本文档
 ```
 
 核心逻辑只依赖标准库（`dataclasses/abc/array/math/queue/threading/logging`），
-`numpy / funasr / sherpa_onnx` 全部惰性导入，因此状态机在 RK 板子和 CI 上都能直接跑：
+`numpy / funasr / sherpa_onnx / sounddevice` 全部惰性导入，因此状态机在 RK 板子和 CI 上都能直接跑：
 
 ```bash
 python -m unittest com.robot.segment.test_segment -v        # 状态机与后端全链路
 python -m com.robot.segment.demo --vad energy in_16k_mono.wav          # 时间轴报告
 python -m com.robot.segment.demo --vad fsmn --out /tmp/seg in_16k_mono.wav   # 需要 funasr
+
+python -m com.robot.segment.demo2 --list-devices                       # 看可用麦克风与通道数
+python -m com.robot.segment.demo2                                      # 默认设备实时分段（需 sounddevice）
+python -m com.robot.segment.demo2 --channels 2 --mix energy --out /tmp/seg
+python -m com.robot.segment.demo2 --channels max --mix multi --duration 30
+python -m com.robot.segment.demo2 --input sim --channels 4 --mix multi  # 无麦克风环境自测
 ```
+
+### 9.2 采集侧参数如何落到本文的时间坐标
+
+`SegmentConfig` 里所有判决门限都是**毫秒**，而设备给的是**样本数**，二者之间只靠
+WAV 四要素换算（`demo2.py` 负责这一段，状态机不感知）：
+
+| 采集参数 | 本文依赖 | 取错的后果 |
+|----------|----------|-----------|
+| `sample_rate`（设备常见 44.1k/48k） | `bytes_per_ms`、`block_samples`、`ring_capacity_ms` | 时间轴整体缩放，`min_silence=300ms` 实际变成 200 或 440ms，切点系统性漂移 |
+| `channels`（单麦 1、双麦 2、阵列 4+） | 强制 `== 1`（`validate` 直接拒绝） | 交织数据当单声道读 ⇒ 时长算错一半、切片跨样本、出现爆音 |
+| 位宽（int16 LE） | `rms_db` 以 32768 为满量程 | 电平/底噪估计全错，`dispatch_min_level_db` 门限失准，段被误判 `low_level` 丢弃 |
+| 设备回调块（`--blocksize`，默认 10ms） | 必须能凑满 `block_ms=32` 的帧栅格 | 帧边界不对齐则派发边界（§5.5 三条约定之二）失效 |
+
+`demo2.py` 的三个设计点与本文的对应关系：
+
+* **多通道收敛**：`--mix mean|energy|copy` 先把多路落成一路；`--mix multi` 则是
+  **每通道一套独立状态机 + 独立环形缓冲**（双麦各自分段、各自送 ASR，互不等待），
+  此时 `utterance_id` 只在各自的流内单调，跨通道不可比。
+* **重采样**：整数比（48k→16k）用箱式平均抽取（等效短窗低通），非整数比
+  （44.1k→16k）用跨块连续的线性插值；判决与段音频统一在 16k 时间坐标上。
+* **丢弃与空洞（G12）**：采集侧丢块时**只把音频时钟推前、不喂数据**，
+  于是 `gap_force_close_ms=200` 会在真的丢帧时强制闭合，段上带 `status=gap`；
+  这与"把丢掉的音频当作没发生"相比，代价是可能多切一句，收益是不会把 0.5s 的
+  缺失音频混进段里静默丢字。真机若频繁出现该日志，说明消费端跟不上（`--qsize`
+  或 VAD 算力问题），应看 `stats.report()["gap_ms"]` 而不是调大 `gap_force_close_ms`。
+
+> 现状缺口：E7 强制闭合目前复用 `CloseReason.EOS`（`engine.py:444`），下游只能靠
+> `status == gap` 区分"采集丢帧截断"与"会话结束"。若 ASR 侧需要据此决定是否拼接，
+> 应新增 `CloseReason.GAP`，同步 §5.3 转移表与 TC16。
 
 ### 9.1 与现有原型 `com/robot/models/asr/asr.py` 的常量对照
 
