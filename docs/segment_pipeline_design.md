@@ -357,6 +357,44 @@ class ISpeechGate(ABC):
     def allow(self) -> Tuple[bool, str]: ...
 ```
 
+#### 5.6.1 派发之后：整句装配层（`collector.py`）
+
+状态机的职责到「派发一段」为止，但 ASR 要的是**一句话**。一句超过 `max_utterance_ms`
+的话会被硬截成 `utt#N:0`、`utt#N:1`…（§5.5），所以需要一个装配层顶在 dispatcher 的位置上，
+**状态机与环形缓冲零改动**：
+
+```
+SegmentEngine ──dispatch(Segment)──► UtteranceAssembler ──take()──► 消费线程（ASR / 落盘）
+   （采集线程，锁内只拼接）              （整句队列）
+```
+
+拼接规则即 §5.5 三条落库约定的镜像：
+
+| 情况 | 判据 | 动作 |
+|------|------|------|
+| 续片 | `utterance_id` 相同、`seq` 递增、起点 `==` 上段终点 | 直接追加 PCM |
+| 空洞 | `seg.start_ms > prev.end_ms` | **补零**（保住「数组下标 ↔ 绝对毫秒」映射）并记 `Hole(+ms)` |
+| 重叠 | `seg.start_ms < prev.end_ms` | **裁掉重复头部**并记 `Hole(−ms)`，同一段音频绝不喂两遍 |
+| 预览 | `seg.partial` | **不入波形**，只挂 `Utterance.preview`（§5.7） |
+| 收尾 | `close_reason != MAX_DURATION` | 整句完成，入队；否则继续等在途片 |
+
+注意「采集丢帧」与「装配空洞」不是一回事：真丢音频时 **E7 在引擎层就把段强制闭合**
+（段上 `status=gap`、`close_reason=eos`，见 §7-G12 与 §9.2 现状缺口），下一片已经属于
+**新的 `utterance_id`**，因此正常链路里装配层看不到正空洞。`Hole` 是一条防御性校验：
+一旦出现，说明 §5.5 的「续段起点 == 上段终点」被破坏（例如 clamp），必须查上游而不是静默补零。
+
+三个数据出口：整句波形（`pcm` / `to_int16` / `to_numpy`）、**逐帧细节数组**
+`frame_detail(frame_ms)`（每帧 `rms_db / peak_db / in_speech / zeroed`，`frame_ms == block_ms`
+时 `index` 与状态机帧序一致）、裁剪后送 ASR 的 `trim_to_speech()`。
+逐帧数组是**在已落整句的 PCM 上重算电平**、再用状态机导出的 `speech_start_ms` /
+`last_speech_ms` 标注语音区间得来的——`SegmentStats` 只保留 `window_ms`（≈2s）滑窗，
+本来也存不下 5s+ 的整句历史，因此不需要在引擎里另开一份缓冲。
+
+背压与内存：`take()` 队列有界（`max_queued`，满了丢最旧并计数），消费线程写盘/跑 ASR
+都不会回头拖住采集线程；会话结束时 `close_pending()` 把没等到收尾片的在途整句
+以 `aborted=True` 交付，对应 §7-G15。多通道 `--mix multi` 必须**每路一个装配器**，
+因为 `utterance_id` 只在单路内单调（§9.2）。
+
 ### 5.7 一次性整段 vs 流式 partial（R7 的延迟代价）
 
 R7 要求"一整段话送入后续处理"，即 **batch 模式**：段闭合前一个字节都不送 ASR。代价是首字延迟 = 段长 + 闭合延迟。对话场景建议提供两档；**落库默认 batch**（严格照 R7 口径，且不引入重复计算），需要快速反馈时显式开 `emit_partial=True`：
@@ -614,7 +652,7 @@ R3 只说"开始启动为空闲"。mic 上电 pop 音、首次噪声底噪未估
 | TC11 | 消费队列塞满 | `D` 仍前进、无异常、`backpressure_drop++`（G11） |
 | TC12 | `ring_capacity=6000, max_utterance=5000` | 启动 `assert` 失败（G5） |
 
-实现期新增（同一文件内，逐条对应上面「补全」里立的规矩；`test_segment.py` 共 37 个用例）：
+实现期新增（同一文件内，逐条对应上面「补全」里立的规矩；`test_segment.py` 共 51 个用例）：
 
 | # | 输入 | 期望 | 覆盖 |
 |---|------|------|------|
@@ -630,6 +668,11 @@ R3 只说"开始启动为空闲"。mic 上电 pop 音、首次噪声底噪未估
 | TC19 | 段输出型 VAD 适配 | 每帧恰好一个概率，滞后恒为 `stride − block`，模型调用次数 == 批数 | G19 |
 | TC20 | 段尾贴窗 vs 段尾远离窗尾 | 前者窗尾必须为语音，后者必须落到静音 | G19 |
 | TC21 | `SPEAKING` 中跌进 `[prob_end, prob_start)` 中间带 | 不提前闭合；`IDLE` 侧中间带不起口 | G13 |
+
+派发**之后**的整句装配层（§5.6.1）另加 14 条 `TestUtteranceAssembly`：硬截断链拼回整句且片序不错位、
+partial 只作预览不入波形、正空洞补零并记 `Hole`、负重叠裁头、没等到收尾片则 `aborted`、
+逐帧细节数组与 `block_ms` 栅格对齐、`trim_to_speech` 用 VAD 边界、队列溢出丢最旧、
+广播出口任一拒收要如实报背压，最后一条把装配器挂在**真状态机**上做 6.2 s 语音的端到端校验。
 
 **调试回放**：帧级 `prob` + 判决 + 段边界落一行 JSONL（`ts, prob, state, action, cand_id`），配合一段 wav 可完整复现任何误触发；`_debug_*.py` 的现有风格可沿用（参考 `com/robot/scheduler/_debug_wheel.py`）。
 
@@ -648,9 +691,11 @@ com/robot/segment/
 ├── dispatcher.py        # ISegmentDispatcher：QueueDispatcher（有界 + 丢 partial 保 final）/ CallbackDispatcher
 ├── gate.py              # ISpeechGate：armed / tts_playing / gate_mode
 ├── stats.py             # §8 指标聚合 + 非语音帧底噪估计（G20）
+├── collector.py         # 派发后的**整句装配层**（§5.6.1）：UtteranceAssembler / Utterance / UtteranceWriter
 ├── demo.py              # 离线回放：wav → 分段 → 落盘段文件 + 时间轴报告
 ├── demo2.py             # 实时采集：麦克风(1/多通道) → 重采样/下混 → 分段
-└── test_segment.py      # TC1–TC21（37 个用例，纯标准库）
+├── demo3.py             # 复用 demo2 采集链路 + 整句装配：完整音频、逐帧细节数组、消费线程
+└── test_segment.py      # TC1–TC21 + 整句装配用例（51 个，纯标准库）
 
 docs/segment_pipeline_design.md   # 本文档
 ```
@@ -668,6 +713,12 @@ python -m com.robot.segment.demo2                                      # 默认�
 python -m com.robot.segment.demo2 --channels 2 --mix energy --out /tmp/seg
 python -m com.robot.segment.demo2 --channels max --mix multi --duration 30
 python -m com.robot.segment.demo2 --input sim --channels 4 --mix multi  # 无麦克风环境自测
+
+# demo3 = demo2 的采集链路 + §5.6.1 的整句装配层（出口换成 UtteranceAssembler + 消费线程）
+python -m com.robot.segment.demo3 --input sim --utt-out /tmp/utt                 # 整句 wav + manifest.jsonl
+python -m com.robot.segment.demo3 --input wav in_16k_mono.wav --arrays --rows 6   # 逐帧细节数组
+python -m com.robot.segment.demo3 --input wav in_16k_mono.wav --frames            # 帧数组写进 manifest
+python -m com.robot.segment.demo3 --channels max --mix multi --utt-out /tmp/utt   # 每路一个装配器
 ```
 
 ### 9.2 采集侧参数如何落到本文的时间坐标
@@ -694,6 +745,9 @@ WAV 四要素换算（`demo2.py` 负责这一段，状态机不感知）：
   这与"把丢掉的音频当作没发生"相比，代价是可能多切一句，收益是不会把 0.5s 的
   缺失音频混进段里静默丢字。真机若频繁出现该日志，说明消费端跟不上（`--qsize`
   或 VAD 算力问题），应看 `stats.report()["gap_ms"]` 而不是调大 `gap_force_close_ms`。
+* **可复用接缝**：`make_config` / `_make_source` / `make_pipelines(disp_factory=…)` / `pump`
+  把「采集 + 分段」与「派发出口」解耦，`demo3.py` 只用 `disp_factory` 换掉每路出口，
+  不必复制一行采集循环就能接上 §5.6.1 的整句装配层与消费线程。
 
 > 现状缺口：E7 强制闭合目前复用 `CloseReason.EOS`（`engine.py:444`），下游只能靠
 > `status == gap` 区分"采集丢帧截断"与"会话结束"。若 ASR 侧需要据此决定是否拼接，

@@ -48,7 +48,7 @@ import sys
 import threading
 import time
 import wave
-from typing import Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 if __package__ in (None, ""):  # 直接以脚本方式运行时补 sys.path
     _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -57,7 +57,7 @@ if __package__ in (None, ""):  # 直接以脚本方式运行时补 sys.path
 
 from com.robot.segment.config import SegmentConfig
 from com.robot.segment.demo import report, write_wav
-from com.robot.segment.dispatcher import CallbackDispatcher
+from com.robot.segment.dispatcher import CallbackDispatcher, ISegmentDispatcher
 from com.robot.segment.engine import SegmentEngine
 from com.robot.segment.models import SegState, Segment
 from com.robot.segment.ring import AudioRingBuffer
@@ -187,10 +187,16 @@ class Downmix:
 # 一路完整管线
 # ======================================================================
 class Segmenter:
-    """一路 mono 采集流 → 16k → 帧栅格 → :class:`SegmentEngine`。"""
+    """一路 mono 采集流 → 16k → 帧栅格 → :class:`SegmentEngine`。
+
+    ``dispatcher`` 是留给上层的**装配接缝**：想换出口（整句装配、ASR 队列、
+    多播）就传一个 :class:`ISegmentDispatcher` 进来，本类和状态机都不用改。
+    不传则用默认的「收集 + 打印」出口，等价于独立跑 demo。
+    """
 
     def __init__(self, cfg: SegmentConfig, src_rate: int, vad, name: str,
-                 live: bool = True) -> None:
+                 live: bool = True,
+                 dispatcher: Optional[ISegmentDispatcher] = None) -> None:
         self.cfg = cfg
         self.name = name
         self.src_rate = src_rate
@@ -199,15 +205,20 @@ class Segmenter:
         self.ring = AudioRingBuffer(cfg)
         self.segments: List[Segment] = []
         self.engine = SegmentEngine(
-            cfg, self.ring, CallbackDispatcher(self._on_segment),
+            cfg, self.ring, dispatcher or CallbackDispatcher(self._collect),
             on_state_change=self._on_state if live else None,
+            on_segment=self._tally,
         )
         self._carry = array.array("h")
         self.delivered = 0       # 已交给状态机的 16k 样本数（音频时钟基准）
         self.dropped_16k = 0     # 采集侧丢弃、只推时钟不进状态机的样本数
+        self.dispatched = 0      # 派发计数（换了自定义出口也有数，供心跳显示）
 
     # ------------------------------------------------------------------
-    def _on_segment(self, seg: Segment) -> None:
+    def _tally(self, seg: Segment) -> None:
+        self.dispatched += 1
+
+    def _collect(self, seg: Segment) -> None:
         self.segments.append(seg)
         print("[%s] %s" % (self.name, seg.summary()), flush=True)
 
@@ -458,26 +469,9 @@ def build_vad(args: argparse.Namespace, cfg: SegmentConfig):
 
 
 # ======================================================================
-# 主流程
+# 主流程（以下四个函数是**可复用接缝**，demo3 直接 import 它们，不复制采集循环）
 # ======================================================================
-def make_pipelines(args: argparse.Namespace, cfg: SegmentConfig, src) -> Tuple[
-        List[Segmenter], Optional[Downmix]]:
-    nch = src.channels
-    if args.mix == "multi" and nch > 1 and args.vad != "energy":
-        print("[note] --mix multi 每个通道一套独立 VAD 实例（%d × %s），"
-              "内存与算力按通道数线性增长" % (nch, args.vad))
-    if args.mix == "multi":
-        segs = [Segmenter(cfg, src.rate, build_vad(args, cfg), "ch%d" % c,
-                          live=not args.quiet) for c in range(nch)]
-        return segs, None
-    mix = "mean" if nch == 1 and args.channel < 0 else args.mix
-    dm = Downmix(nch, mode=mix, channel=args.channel, keep_db=args.keep_db,
-                 fade_blocks=args.fade_blocks)
-    name = {"mean": "mix:mean", "energy": "mix:energy", "copy": "mix:ch%d" % dm.pick}[dm.mode]
-    return [Segmenter(cfg, src.rate, build_vad(args, cfg), name, live=not args.quiet)], dm
-
-
-def run(args: argparse.Namespace) -> int:
+def make_config(args: argparse.Namespace) -> SegmentConfig:
     cfg = SegmentConfig(
         sample_rate=args.sample_rate, channels=1, block_ms=args.block_ms,
         ring_capacity_ms=args.ring_ms, vad_lag_ms=args.vad_lag,
@@ -488,7 +482,74 @@ def run(args: argparse.Namespace) -> int:
         emit_partial=args.emit_partial, warmup_ms=args.warmup,
     )
     cfg.validate()
+    return cfg
 
+
+def make_pipelines(args: argparse.Namespace, cfg: SegmentConfig, src,
+                   disp_factory: Optional[Callable[[str], ISegmentDispatcher]] = None
+                   ) -> Tuple[List[Segmenter], Optional[Downmix]]:
+    """建管线。``disp_factory(name)`` 给每路一个自定义出口（整句装配器等）。"""
+    nch = src.channels
+    if args.mix == "multi" and nch > 1 and args.vad != "energy":
+        print("[note] --mix multi 每个通道一套独立 VAD 实例（%d × %s），"
+              "内存与算力按通道数线性增长" % (nch, args.vad))
+    if args.mix == "multi":
+        segs = [Segmenter(cfg, src.rate, build_vad(args, cfg), "ch%d" % c,
+                          live=not args.quiet,
+                          dispatcher=disp_factory("ch%d" % c) if disp_factory else None)
+                for c in range(nch)]
+        return segs, None
+    mix = "mean" if nch == 1 and args.channel < 0 else args.mix
+    dm = Downmix(nch, mode=mix, channel=args.channel, keep_db=args.keep_db,
+                 fade_blocks=args.fade_blocks)
+    name = {"mean": "mix:mean", "energy": "mix:energy", "copy": "mix:ch%d" % dm.pick}[dm.mode]
+    return [Segmenter(cfg, src.rate, build_vad(args, cfg), name, live=not args.quiet,
+                      dispatcher=disp_factory(name) if disp_factory else None)], dm
+
+
+def pump(src, segs: List[Segmenter], dm: Optional[Downmix], args: argparse.Namespace) -> Dict[str, int]:
+    """采集主循环：每个设备块 → 拆通道 → 下混/多路 → 喂各自的状态机。
+
+    见模块 docstring 与文档 §5.1：循环里的时间坐标一律是**音频时钟**，
+    丢块只推时钟不喂数据，让状态机自己看见空洞（文档 §7-G12）。
+    """
+    nch = src.channels
+    seen_drops = getattr(src, "dropped_frames", 0)
+    t0 = time.monotonic()
+    last_beat = 0.0
+    frames_total = 0
+    for pcm, frames in src.blocks():
+        frames_total += frames
+        lost = getattr(src, "dropped_frames", 0) - seen_drops
+        if lost > 0:
+            for s in segs:
+                s.skip(lost)
+            seen_drops = getattr(src, "dropped_frames", 0)
+        a = array.array("h")
+        a.frombytes(pcm[:len(pcm) - len(pcm) % 2])
+        chans = [a] if nch == 1 else [a[c::nch] for c in range(nch)]
+        if dm is None:                       # multi：每通道一套状态机
+            for c, s in enumerate(segs):
+                s.feed(chans[c])
+        else:
+            segs[0].feed(dm.process(chans))
+
+        now = time.monotonic()
+        if (src.realtime and not args.quiet and not args.no_heartbeat
+                and now - last_beat >= 1.0):
+            last_beat = now
+            aud = segs[0].total_ms
+            print("\r[采集 %.1fs] 音频时钟 %.2fs（漂移 %+.0fms）派发=%d        "
+                  % (now - t0, aud / 1000.0, aud - (now - t0) * 1000.0,
+                     sum(s.dispatched for s in segs)), flush=True)
+        if src.realtime and args.duration and (now - t0) >= args.duration:
+            print("\n到达 --duration %.1fs（墙钟），停止采集" % args.duration, flush=True)
+            break
+    return {"frames": frames_total, "wall_ms": int((time.monotonic() - t0) * 1000)}
+
+
+def run(args: argparse.Namespace) -> int:
+    cfg = make_config(args)
     src = _make_source(args)
     with src:
         segs, dm = make_pipelines(args, cfg, src)
@@ -500,42 +561,7 @@ def run(args: argparse.Namespace) -> int:
               "max_utter=%dms pre=%dms post=%dms emit_partial=%s" % (
                   cfg.block_ms, cfg.vad_lag_ms, cfg.min_speech_ms, cfg.min_silence_ms,
                   cfg.max_utterance_ms, cfg.pre_roll_ms, cfg.post_roll_ms, cfg.emit_partial))
-
-        nch = src.channels
-        seen_drops = getattr(src, "dropped_frames", 0)
-        t0 = time.monotonic()
-        last_beat = 0.0
-        frames_total = 0
-        for pcm, frames in src.blocks():
-            frames_total += frames
-            lost = getattr(src, "dropped_frames", 0) - seen_drops
-            if lost > 0:
-                for s in segs:
-                    s.skip(lost)
-                seen_drops = getattr(src, "dropped_frames", 0)
-            a = array.array("h")
-            a.frombytes(pcm[:len(pcm) - len(pcm) % 2])
-            if nch == 1:
-                chans = [a]
-            else:
-                chans = [a[c::nch] for c in range(nch)]
-            if dm is None:                       # multi：每通道一套状态机
-                for c, s in enumerate(segs):
-                    s.feed(chans[c])
-            else:
-                segs[0].feed(dm.process(chans))
-
-            now = time.monotonic()
-            if (src.realtime and not args.quiet and not args.no_heartbeat
-                    and now - last_beat >= 1.0):
-                last_beat = now
-                aud = segs[0].total_ms
-                print("\r[采集 %.1fs] 音频时钟 %.2fs（漂移 %+.0fms）段数=%d        "
-                      % (now - t0, aud / 1000.0, aud - (now - t0) * 1000.0,
-                         sum(len(s.segments) for s in segs)), flush=True)
-            if src.realtime and args.duration and (now - t0) >= args.duration:
-                print("\n到达 --duration %.1fs（墙钟），停止采集" % args.duration, flush=True)
-                break
+        stats = pump(src, segs, dm, args)
 
     for s in segs:                               # §7-G15：停止采集必须闭合在途段
         s.flush()
@@ -550,7 +576,7 @@ def run(args: argparse.Namespace) -> int:
                 dm.sel, dm.switches,
                 ["%.0fdB" % v for v in dm.levels] if dm.levels else "n/a"))
     print("\n采集帧=%d（%.2fs）丢弃=%d 次 overruns=%d" % (
-        frames_total, frames_total / float(src.rate),
+        stats["frames"], stats["frames"] / float(src.rate),
         getattr(src, "dropped_frames", 0), getattr(src, "overruns", 0)))
     print(json.dumps({"pipelines": [
         {"name": s.name, "audio_ms": s.total_ms, "dropped_16k_frames": s.dropped_16k,
@@ -585,7 +611,8 @@ def _make_source(args: argparse.Namespace):
     return MicSource(args)
 
 
-def parse_args(argv: List[str]) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
+    """暴露 parser（而非只暴露 parse_args），demo3 等下游可 ``add_argument`` 扩展 CLI。"""
     p = argparse.ArgumentParser(description="实时麦克风 VAD 分段 demo")
     p.add_argument("wav", nargs="?", default="", help="--input wav 时的文件路径")
     p.add_argument("--input", choices=("mic", "wav", "sim"), default="mic",
@@ -629,7 +656,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--no-heartbeat", action="store_true")
     p.add_argument("--quiet", action="store_true", help="不打印实时事件与报告，只留摘要")
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(argv)
+    return p
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def _print_devices() -> int:

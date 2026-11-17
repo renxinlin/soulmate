@@ -12,6 +12,10 @@
 写入环形缓冲的 PCM 采用「每块首样本 = 该块起始毫秒」的编码，
 于是 :class:`Segment.samples` 的首样本可以直接还原出派发起点，
 用来精确校验 pre-roll 与环形回绕读取是否正确（派发边界对齐到帧栅格，见 §7-G7）。
+
+``TestUtteranceAssembly`` 覆盖的是**派发之后**的整句装配层（``collector.py``，文档 §5.6）：
+硬截断拼接、partial 不入波形、空洞补零 / 重叠裁头、逐帧细节数组、队列溢出，
+其中一条端到端用例直接把装配器挂在真状态机出口上。
 """
 from __future__ import annotations
 
@@ -19,17 +23,21 @@ import array
 import os
 import sys
 import unittest
+import wave
 
 if __package__ in (None, ""):  # 直接以脚本方式运行时补 sys.path
     _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     if _ROOT not in sys.path:
         sys.path.insert(0, _ROOT)
 
+from com.robot.segment.collector import (
+    BroadcastDispatcher, Utterance, UtteranceAssembler, UtteranceWriter)
 from com.robot.segment.config import ConfigError, SegmentConfig
 from com.robot.segment.dispatcher import CallbackDispatcher, QueueDispatcher
 from com.robot.segment.engine import SegmentEngine
 from com.robot.segment.gate import StaticGate
-from com.robot.segment.models import AudioFrame, CloseReason, SampleStatus, SegState
+from com.robot.segment.models import (
+    AudioFrame, CloseReason, SampleStatus, SegState, Segment)
 from com.robot.segment.ring import AudioRingBuffer
 from com.robot.segment.vad import (
     EnergyVad,
@@ -592,6 +600,210 @@ class TestStats(unittest.TestCase):
         self.assertEqual(rep["final_segments"], 1)
         self.assertEqual(rep["gap_ms"], 0)
         self.assertLess(h.engine.stats.noise_floor_db(), -50)
+
+
+def mk_seg(seg_id=1, utt=1, seq=0, s=0, e=1000, reason=CloseReason.MAX_DURATION,
+           partial=False, speech=(0, 0), amp=3000, rate=16000):
+    """造一片派发段：语音区间内是 ``amp`` 方波、区间外是数字零。
+
+    方波便于校验拼接后的字节序与补零位置，零区间便于校验逐帧电平数组。
+    """
+    n = (e - s) * rate // 1000
+    a = array.array("h", [amp if i % 2 == 0 else -amp for i in range(n)])
+    lo, hi = speech
+    if hi > lo:
+        for i in range(max(0, (lo - s) * rate // 1000)):
+            a[i] = 0
+        for i in range(min(n, (hi - s) * rate // 1000), n):
+            a[i] = 0
+    return Segment(
+        seg_id=seg_id, utterance_id=utt, seq_in_utterance=seq, start_ms=s, end_ms=e,
+        duration_ms=e - s, samples=a.tobytes(), sample_rate=rate,
+        close_reason=reason, partial=partial,
+        speech_start_ms=lo, last_speech_ms=hi)
+
+
+class TestUtteranceAssembly(unittest.TestCase):
+    """整句装配层（``collector.py``）：拼接、partial、空洞、裁剪、逐帧数组、队列。"""
+
+    def test_stitches_max_duration_chain(self):
+        asm = UtteranceAssembler(tag="t")
+        asm.dispatch(mk_seg(1, seq=0, s=0, e=5000, amp=1000))
+        asm.dispatch(mk_seg(2, seq=1, s=5000, e=9000, amp=2000, reason=CloseReason.SILENCE))
+        utt = asm.take()
+        self.assertIsNotNone(utt)
+        self.assertEqual((utt.start_ms, utt.end_ms, utt.duration_ms), (0, 9000, 9000))
+        self.assertTrue(utt.complete and not utt.aborted)
+        self.assertEqual(utt.close_reason, "silence")
+        self.assertTrue(utt.contiguous)
+        a = utt.to_int16()
+        self.assertEqual(len(a), 9000 * 16)
+        self.assertEqual({abs(x) for x in a[: 5000 * 16]}, {1000})       # 片顺序没串位
+        self.assertEqual({abs(x) for x in a[5000 * 16:]}, {2000})
+        self.assertEqual(asm.take(), None)                               # 队列只有一条
+
+    def test_partial_is_preview_only(self):
+        asm = UtteranceAssembler()
+        # 句子还没开：预览只计数，不会凭空造出一句
+        asm.dispatch(mk_seg(1, utt=1, partial=True, s=0, e=3000, reason=CloseReason.SILENCE))
+        self.assertIsNone(asm.take())
+        self.assertIsNone(asm.current())
+        self.assertEqual(asm.stats()["previews"], 1)
+        # 句子开了（片 0 是硬截断片）→ 之后的预览挂到在途句，final 才进波形
+        asm.dispatch(mk_seg(2, utt=1, seq=0, s=0, e=5000))
+        asm.dispatch(mk_seg(3, utt=1, seq=1, partial=True, s=0, e=6000,
+                            reason=CloseReason.SILENCE))
+        asm.dispatch(mk_seg(3, utt=1, seq=1, s=5000, e=6000, reason=CloseReason.SILENCE))
+        utt = asm.take()
+        self.assertEqual(utt.duration_ms, 6000)                          # partial 没混进波形
+        self.assertEqual([p.seg_id for p in utt.parts], [2, 3])
+        self.assertTrue(utt.preview.partial)
+        self.assertEqual(utt.preview.seg_id, 3)
+
+    def test_open_utterance_waits_for_non_max_duration(self):
+        asm = UtteranceAssembler()
+        asm.dispatch(mk_seg(1, s=0, e=5000))
+        self.assertIsNone(asm.take())
+        cur = asm.current()
+        self.assertEqual((cur.utterance_id, len(cur.parts), cur.complete), (1, 1, False))
+        pend = asm.close_pending()                                       # 会话结束兜底
+        self.assertEqual(len(pend), 1)
+        self.assertTrue(pend[0].aborted)
+        self.assertEqual(pend[0].close_reason, "session_end")
+
+    def test_hole_is_zero_filled_and_accounted(self):
+        asm = UtteranceAssembler()
+        asm.dispatch(mk_seg(1, seq=0, s=0, e=1000, amp=3000))
+        asm.dispatch(mk_seg(2, seq=1, s=1500, e=2500, amp=3000, reason=CloseReason.EOS))
+        utt = asm.take()
+        self.assertEqual(utt.duration_ms, 2500)                          # 下标↔毫秒映射没断
+        self.assertFalse(utt.contiguous)
+        self.assertEqual(utt.hole_ms, 500)
+        self.assertEqual([(h.from_seg, h.to_seg, h.gap_ms) for h in utt.holes], [(1, 2, 500)])
+        a = utt.to_int16()
+        self.assertEqual(set(a[1000 * 16:1500 * 16]), {0})
+        self.assertTrue(all(f.zeroed for f in utt.frame_detail(32)
+                            if 1000 <= f.start_ms < 1500))
+        self.assertFalse(any(f.zeroed for f in utt.frame_detail(32) if f.start_ms >= 1500))
+
+    def test_overlap_head_is_trimmed(self):
+        asm = UtteranceAssembler()
+        asm.dispatch(mk_seg(1, seq=0, s=0, e=1000))
+        asm.dispatch(mk_seg(2, seq=1, s=800, e=1800, reason=CloseReason.EOS))
+        utt = asm.take()
+        self.assertEqual(utt.duration_ms, 1800)                          # 同一段音频不喂两遍
+        self.assertEqual([h.gap_ms for h in utt.holes], [-200])
+        self.assertEqual(utt.parts[1].meta["head_trimmed_bytes"], 200 * 16 * 2)
+
+    def test_new_utterance_aborts_pending_one(self):
+        asm = UtteranceAssembler()
+        asm.dispatch(mk_seg(1, utt=1, s=0, e=5000))                      # 没有收尾片
+        asm.dispatch(mk_seg(2, utt=2, seq=0, s=6000, e=7000, reason=CloseReason.EOS))
+        out = asm.drain()
+        self.assertEqual([u.utterance_id for u in out], [1, 2])
+        self.assertTrue(out[0].aborted and not out[1].aborted)
+
+    def test_seq_gap_rejected(self):
+        utt = Utterance(1, 16000)
+        utt.append(mk_seg(1, seq=0))
+        with self.assertRaises(ValueError):
+            utt.append(mk_seg(2, seq=2))
+
+    def test_sample_rate_mismatch_rejected(self):
+        utt = Utterance(1, 16000)
+        with self.assertRaises(ValueError):
+            utt.append(mk_seg(1, rate=8000))
+
+    def test_frame_detail_grid_matches_block_ms(self):
+        utt = Utterance(1, 16000)
+        utt.append(mk_seg(1, s=0, e=1024, reason=CloseReason.EOS, speech=(64, 960)))
+        fr = utt.frame_detail(32)
+        self.assertEqual(len(fr), 1024 // 32)                            # 与状态机帧数一致
+        self.assertEqual([f.index for f in fr[:3]], [0, 1, 2])
+        self.assertEqual(fr[0].end_ms - fr[0].start_ms, 32)
+        self.assertTrue(any(f.in_speech for f in fr))
+        self.assertFalse(fr[0].in_speech)
+        self.assertGreater(min(f.rms_db for f in fr if f.in_speech), -30)
+        self.assertLess(min(f.rms_db for f in fr if not f.in_speech), -100)
+
+    def test_trim_to_speech_uses_vad_bounds(self):
+        utt = Utterance(1, 16000)
+        utt.append(mk_seg(1, s=1000, e=3000, reason=CloseReason.EOS, speech=(1200, 2700)))
+        trim = utt.trim_to_speech(pad_ms=40)
+        self.assertEqual(len(trim), (2700 - 1200 + 80) * 16)             # 语音区间 + 两侧余量
+        self.assertEqual(utt.ms_to_index(1200), 1200 * 16 - 1000 * 16)
+        self.assertEqual(utt.index_to_ms(16 * 200), 1200)
+
+    def test_queue_overflow_drops_oldest(self):
+        asm = UtteranceAssembler(max_queued=2)
+        for i in range(1, 5):
+            asm.dispatch(mk_seg(i, utt=i, s=0, e=1000, reason=CloseReason.EOS))
+        self.assertEqual(asm.stats()["dropped_queued"], 2)
+        self.assertEqual([u.utterance_id for u in asm.drain()], [3, 4])
+
+    def test_broadcast_fans_out_and_propagates_refusal(self):
+        seen = []
+        asm = UtteranceAssembler()
+        bc = BroadcastDispatcher([asm, CallbackDispatcher(seen.append)])
+        self.assertTrue(bc.dispatch(mk_seg(1, reason=CloseReason.EOS)))
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(asm.take())
+        # 任一下游拒收就要告诉状态机「没吃下」，否则背压统计会说谎
+        q = QueueDispatcher(maxsize=1, drop_policy="reject")
+        bc2 = BroadcastDispatcher([asm, q])
+        self.assertTrue(bc2.dispatch(mk_seg(2, utt=2, reason=CloseReason.EOS)))
+        self.assertFalse(bc2.dispatch(mk_seg(3, utt=3, reason=CloseReason.EOS)))
+        self.assertEqual(q.stats()["dropped"], 1)
+        self.assertEqual(asm.stats()["parts"], 3)
+
+    def test_writer_emits_wav_and_manifest_with_frames(self):
+        import json as _json
+        import shutil
+        import tempfile
+
+        out = tempfile.mkdtemp(prefix="seg_utt_")
+        try:
+            asm = UtteranceAssembler(tag="ch0")
+            writer = UtteranceWriter(out, frames=True, frame_ms=32)
+            asm.dispatch(mk_seg(1, seq=0, s=0, e=5000, speech=(128, 4900)))
+            asm.dispatch(mk_seg(2, seq=1, s=5000, e=6000, reason=CloseReason.SILENCE,
+                                speech=(5024, 5900)))
+            utt = asm.take()
+            rec = writer(utt)
+            self.assertEqual(rec["n_samples"], 6000 * 16)
+            self.assertEqual(len(rec["frames"]), -(-6000 // 32))          # 末帧不满也计一帧
+            for kind in ("full", "trim"):
+                with wave.open(rec["files"][kind], "rb") as r:
+                    self.assertEqual((r.getnchannels(), r.getsampwidth(), r.getframerate()),
+                                     (1, 2, 16000))
+                    self.assertEqual(r.getnframes(), rec["n_samples"] if kind == "full"
+                                     else rec["trim_samples"])
+            with open(os.path.join(out, "ch0", "manifest.jsonl"), encoding="utf-8") as fh:
+                lines = fh.read().strip().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(_json.loads(lines[0])["utterance_id"], 1)
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+    def test_engine_to_assembler_end_to_end(self):
+        """接在真状态机出口上：6.2s 连续语音 → 硬截断两片 → 装配回一整句。"""
+        asm = UtteranceAssembler(tag="live")
+        seen = []
+        h = Harness(dispatcher=BroadcastDispatcher([asm, CallbackDispatcher(seen.append)]))
+        h.speak(6200).quiet(700)
+        h.engine.flush()
+        utt = asm.take()
+        self.assertIsNotNone(utt, "dispatch 之后整句应已可 take()")
+        self.assertGreaterEqual(len(utt.parts), 2)                       # 确实被硬截断过
+        self.assertGreaterEqual(len(seen), 2)                            # 广播没吞掉任何一片
+        self.assertTrue(utt.complete and not utt.aborted)
+        self.assertEqual(utt.hole_ms, 0)
+        self.assertEqual(utt.duration_ms, utt.end_ms - utt.start_ms)
+        self.assertGreaterEqual(utt.duration_ms, 6200)
+        # PCM 来自环形缓冲：每块首样本编码了该块的起始毫秒（见文件 docstring）
+        self.assertEqual(utt.to_int16()[0], utt.start_ms)
+        self.assertEqual(asm.close_pending(), [])                        # 没有半截在途句
+
 
 def main() -> int:
     import logging
