@@ -16,6 +16,9 @@
 ``TestUtteranceAssembly`` 覆盖的是**派发之后**的整句装配层（``collector.py``，文档 §5.6）：
 硬截断拼接、partial 不入波形、空洞补零 / 重叠裁头、逐帧细节数组、队列溢出，
 其中一条端到端用例直接把装配器挂在真状态机出口上。
+交付载荷（``to_bundle``，文档 §5.6.1）也验一批：整句 / 语音双视图的时间映射与切片、
+补零区间随视图裁剪、以及 ``separation`` / ``asr`` / ``voiceprint`` 的可用性判定
+——正空洞拦分离、空语音拦 ASR、短语音与任何 suspect 拦声纹。
 
 ``TestCaptureDrain`` 覆盖的是**派发之前**的采集侧接缝（``demo2.pump``，文档 §9.2）：
 起流期间攒下的积压必须在第一个块之前丢掉，于是状态机处理的是「当前时刻」的语音，
@@ -24,6 +27,7 @@
 from __future__ import annotations
 
 import array
+import math
 import os
 import sys
 import unittest
@@ -35,7 +39,8 @@ if __package__ in (None, ""):  # 直接以脚本方式运行时补 sys.path
         sys.path.insert(0, _ROOT)
 
 from com.robot.segment.collector import (
-    BroadcastDispatcher, Utterance, UtteranceAssembler, UtteranceWriter)
+    AudioView, BroadcastDispatcher, Utterance, UtteranceAssembler, UtteranceBundle,
+    UtteranceWriter)
 from com.robot.segment.config import ConfigError, SegmentConfig
 from com.robot.segment.dispatcher import CallbackDispatcher, QueueDispatcher
 from com.robot.segment.engine import SegmentEngine
@@ -607,10 +612,11 @@ class TestStats(unittest.TestCase):
 
 
 def mk_seg(seg_id=1, utt=1, seq=0, s=0, e=1000, reason=CloseReason.MAX_DURATION,
-           partial=False, speech=(0, 0), amp=3000, rate=16000):
+           partial=False, speech=(0, 0), amp=3000, rate=16000, status=SampleStatus.CLEAN):
     """造一片派发段：语音区间内是 ``amp`` 方波、区间外是数字零。
 
     方波便于校验拼接后的字节序与补零位置，零区间便于校验逐帧电平数组。
+    ``status`` 默认 ``clean``，用来模拟采集异常片（文档 §5.4 ``gap`` / ``clamped``）。
     """
     n = (e - s) * rate // 1000
     a = array.array("h", [amp if i % 2 == 0 else -amp for i in range(n)])
@@ -624,11 +630,11 @@ def mk_seg(seg_id=1, utt=1, seq=0, s=0, e=1000, reason=CloseReason.MAX_DURATION,
         seg_id=seg_id, utterance_id=utt, seq_in_utterance=seq, start_ms=s, end_ms=e,
         duration_ms=e - s, samples=a.tobytes(), sample_rate=rate,
         close_reason=reason, partial=partial,
-        speech_start_ms=lo, last_speech_ms=hi)
+        speech_start_ms=lo, last_speech_ms=hi, status=status)
 
 
 class TestUtteranceAssembly(unittest.TestCase):
-    """整句装配层（``collector.py``）：拼接、partial、空洞、裁剪、逐帧数组、队列。"""
+    """整句装配层（``collector.py``）：拼接、partial、空洞、裁剪、逐帧数组、交付载荷、队列。"""
 
     def test_stitches_max_duration_chain(self):
         asm = UtteranceAssembler(tag="t")
@@ -738,6 +744,132 @@ class TestUtteranceAssembly(unittest.TestCase):
         self.assertEqual(utt.ms_to_index(1200), 1200 * 16 - 1000 * 16)
         self.assertEqual(utt.index_to_ms(16 * 200), 1200)
 
+    # ---------------------------------------------------------------- 交付载荷
+    def test_clean_sentence_is_usable_for_all_three_tasks(self):
+        """三片硬截断拼回的一句干净话：分离 / ASR / 声纹都该能直接开跑。"""
+        asm = UtteranceAssembler(tag="ch0")
+        asm.dispatch(mk_seg(1, seq=0, s=0, e=5000, speech=(200, 4800)))
+        asm.dispatch(mk_seg(2, seq=1, s=5000, e=10000, speech=(5100, 9800)))
+        asm.dispatch(mk_seg(3, seq=2, s=10000, e=12000, reason=CloseReason.SILENCE,
+                            speech=(10100, 11800)))
+        b = asm.take().to_bundle()
+        self.assertIsInstance(b, UtteranceBundle)
+        self.assertIsInstance(b.full, AudioView)
+        self.assertEqual(b.usable_for, {"separation": "ok", "asr": "ok", "voiceprint": "ok"})
+        self.assertTrue(all(b.usable(t) for t in ("separation", "asr", "voiceprint")))
+        self.assertFalse(b.suspect)
+        self.assertEqual((b.n_parts, b.seq_first, b.seq_last), (3, 0, 2))
+        self.assertEqual((b.start_ms, b.end_ms, b.duration_ms), (0, 12000, 12000))
+        self.assertEqual(b.close_reason, "silence")
+        self.assertEqual((b.speech_start_ms, b.speech_end_ms), (200, 11800))   # 原始 VAD 边界
+        self.assertEqual(b.speech.duration_ms, 11800 - 200 + 80)               # 边界 + 两侧 pad
+        # 两个视图出自同一次解码：切片能逐字节对上，没有第二次 O(N) 解码
+        self.assertEqual(b.speech.pcm, b.full.pcm[160 * 32:11840 * 32])
+        import json as _json
+        d = _json.loads(b.json())
+        self.assertEqual(d["usable_for"]["asr"], "ok")
+        self.assertEqual(set(d["views"]), {"full", "speech"})
+        self.assertNotIn("samples", d)                                         # 波形不进 JSON
+        self.assertNotIn("pcm", d["views"]["full"])
+
+    def test_positive_hole_blocks_separation_but_not_asr(self):
+        """正空洞补的是假样本：分离会被它凭空造出一个「源」，转写照常吃剩下的真声。"""
+        asm = UtteranceAssembler()
+        asm.dispatch(mk_seg(1, seq=0, s=0, e=1000, speech=(100, 900)))
+        asm.dispatch(mk_seg(2, seq=1, s=1500, e=2500, reason=CloseReason.EOS,
+                            speech=(1600, 2400)))
+        b = asm.take().to_bundle()
+        self.assertEqual(b.usable_for["separation"], "hole_+500ms")
+        self.assertEqual(b.usable_for["asr"], "ok")
+        self.assertEqual(b.usable_for["voiceprint"], "hole_+500ms")            # 声纹最怕伪影
+        self.assertIn("hole_+500ms", b.suspect_reasons)
+        self.assertIn("zeroed_in_speech_500ms", b.suspect_reasons)
+        self.assertEqual(b.zeroed_spans_ms, ((1000, 1500),))
+        self.assertEqual(b.full.zeroed_spans_ms, ((1000, 1500),))
+        self.assertEqual(b.speech.zeroed_spans_ms, ((1000, 1500),))
+        self.assertTrue(b.full.has_zeroed(1200, 1300))
+        self.assertFalse(b.full.has_zeroed(1500, 2000))
+        self.assertEqual(b.speech_duration_ms, 2440 - 60)
+
+    def test_overlap_is_trimmed_and_flagged_as_suspect(self):
+        asm = UtteranceAssembler()
+        asm.dispatch(mk_seg(1, seq=0, s=0, e=1000, speech=(100, 900)))
+        asm.dispatch(mk_seg(2, seq=1, s=800, e=2800, reason=CloseReason.EOS,
+                            speech=(900, 2700)))
+        b = asm.take().to_bundle()
+        self.assertIn("overlap_200ms", b.suspect_reasons)
+        self.assertEqual(b.usable_for["separation"], "ok")                     # 裁头即可，没造假样本
+        self.assertEqual(b.usable_for["voiceprint"], "overlap_200ms")
+        self.assertEqual(b.hole_ms, 200)
+
+    def test_short_speech_is_not_enough_for_voiceprint(self):
+        """短音频的说话人嵌入极不稳：ASR 照转，声纹要够长才放行。"""
+        utt = Utterance(1, 16000)
+        utt.append(mk_seg(1, s=1000, e=3000, reason=CloseReason.EOS, speech=(1200, 1500)))
+        b = utt.to_bundle()
+        self.assertEqual(b.speech_duration_ms, 300 + 80)
+        self.assertEqual(b.usable_for["voiceprint"], "short_380ms")
+        self.assertEqual(b.usable_for["asr"], "ok")
+        self.assertEqual(utt.to_bundle(min_voiceprint_ms=300).usable_for["voiceprint"], "ok")
+    def test_bundle_without_vad_speech_has_empty_speech_view(self):
+        """没判出语音时 speech 视图是空的（不退回整句），下游看时长就知道该跳过。
+
+        在途句子的打包只在单线程里读（真实链路要等 ``take()``，见 ``to_bundle`` 文档）。
+        """
+        asm = UtteranceAssembler()
+        asm.dispatch(mk_seg(1, utt=1, s=0, e=5000))                            # 没有收尾片
+        live = asm.current().to_bundle()                                       # 句子还在说
+        self.assertIn("incomplete", live.suspect_reasons)
+        self.assertEqual(live.usable_for["separation"], "ok")
+        b = asm.close_pending()[0].to_bundle()                                 # 兜底强制收尾
+        self.assertTrue(b.aborted)
+        self.assertEqual(b.close_reason, "session_end")
+        self.assertIn("aborted", b.suspect_reasons)
+        self.assertEqual(b.speech.n_samples, 0)
+        self.assertEqual((b.speech_start_ms, b.speech_end_ms, b.speech_duration_ms), (0, 0, 0))
+        self.assertEqual(b.usable_for["asr"], "no_speech")
+        self.assertEqual(b.usable_for["voiceprint"], "short_0ms")
+        self.assertEqual(b.usable_for["separation"], "ok")                     # 波形本身是完整的
+        self.assertFalse(b.usable("asr"))
+
+    def test_dirty_segment_status_makes_the_bundle_suspect(self):
+        """片本身带 gap（采集 overrun / E7 强制闭合）时必须挂到 suspect 上。"""
+        utt = Utterance(1, 16000)
+        utt.append(mk_seg(1, s=1000, e=4000, reason=CloseReason.SILENCE,
+                          speech=(1100, 3800), status=SampleStatus.GAP))
+        b = utt.to_bundle()
+        self.assertIn("seg#1_gap", b.suspect_reasons)
+        self.assertEqual(b.usable_for["voiceprint"], "seg#1_gap")
+        self.assertEqual(b.usable_for["asr"], "ok")
+        self.assertEqual(b.usable_for["separation"], "ok")
+
+    def test_view_time_mapping_slicing_and_numpy_scale(self):
+        asm = UtteranceAssembler()
+        asm.dispatch(mk_seg(1, s=1000, e=2000, reason=CloseReason.EOS, speech=(1032, 1900)))
+        b = asm.take().to_bundle(frame_ms=32, with_frames=True)
+        v = b.full
+        self.assertEqual(v.index_to_ms(v.ms_to_index(1500)), 1500)              # 下标 ↔ 毫秒互逆
+        self.assertEqual(v.ms_to_index(999999), v.n_samples)                    # 越界夹住而不是报错
+        self.assertEqual(v.level_db()[1], 20.0 * math.log10(3000 / 32768.0))
+        w = v.slice_ms(1200, 1400)
+        self.assertEqual((w.source, w.start_ms, w.duration_ms), ("full[1200,1400]", 1200, 200))
+        self.assertEqual(len(w), 200 * 16)
+        with self.assertRaises(ValueError):
+            v.slice_ms(5000, 6000)                                              # 越界切片不静默给空
+        with self.assertRaises(ValueError):
+            b.audio("left")
+        self.assertEqual(len(b.frames), -(-1000 // 32))                        # 末帧不满也计一帧
+        self.assertTrue(any(f.in_speech for f in b.frames))
+        try:
+            import numpy as np
+        except ImportError:
+            return                                                             # 核心链路不依赖 numpy
+        a = v.to_numpy()
+        self.assertEqual(a.shape, (1000 * 16,))
+        self.assertEqual(str(a.dtype), "float32")
+        self.assertAlmostEqual(float(np.max(np.abs(a))), 3000 / 32768.0, places=5)
+        self.assertEqual(int(np.max(np.abs(v.to_numpy(normalize=False)))), 3000)
+
     def test_queue_overflow_drops_oldest(self):
         asm = UtteranceAssembler(max_queued=2)
         for i in range(1, 5):
@@ -806,6 +938,10 @@ class TestUtteranceAssembly(unittest.TestCase):
         self.assertGreaterEqual(utt.duration_ms, 6200)
         # PCM 来自环形缓冲：每块首样本编码了该块的起始毫秒（见文件 docstring）
         self.assertEqual(utt.to_int16()[0], utt.start_ms)
+        b = utt.to_bundle()                                                    # 交付载荷走真链路
+        self.assertTrue(b.usable("separation") and b.usable("asr"))
+        self.assertEqual(b.suspect_reasons, ())
+        self.assertGreaterEqual(b.speech_duration_ms, 5000)                     # VAD 边界没吞内容
         self.assertEqual(asm.close_pending(), [])                        # 没有半截在途句
 
 

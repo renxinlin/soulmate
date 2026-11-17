@@ -383,12 +383,38 @@ SegmentEngine ──dispatch(Segment)──► UtteranceAssembler ──take()�
 **新的 `utterance_id`**，因此正常链路里装配层看不到正空洞。`Hole` 是一条防御性校验：
 一旦出现，说明 §5.5 的「续段起点 == 上段终点」被破坏（例如 clamp），必须查上游而不是静默补零。
 
-三个数据出口：整句波形（`pcm` / `to_int16` / `to_numpy`）、**逐帧细节数组**
+前三个数据出口：整句波形（`pcm` / `to_int16` / `to_numpy`）、**逐帧细节数组**
 `frame_detail(frame_ms)`（每帧 `rms_db / peak_db / in_speech / zeroed`，`frame_ms == block_ms`
 时 `index` 与状态机帧序一致）、裁剪后送 ASR 的 `trim_to_speech()`。
 逐帧数组是**在已落整句的 PCM 上重算电平**、再用状态机导出的 `speech_start_ms` /
 `last_speech_ms` 标注语音区间得来的——`SegmentStats` 只保留 `window_ms`（≈2s）滑窗，
 本来也存不下 5s+ 的整句历史，因此不需要在引擎里另开一份缓冲。
+
+第四个出口是**交付载荷** `to_bundle()` → `UtteranceBundle`（含两个 `AudioView`）：整句 PCM
+只解码一次，两个视图都从同一份数组切出，把「trim + manifest + 空洞判断」这套每个下游任务
+都要重写的代码收在一处，直接喂语音分离 / ASR / 声纹：
+
+| 视图 | 区间 | 给谁用 |
+|------|------|--------|
+| `full` | `[parts[0].start_ms, parts[-1].end_ms)`，含 pre/post_roll、含补零空洞 | 语音分离（上下文静音对它有用） |
+| `speech` | `[speech_start − pad, speech_end + pad]` 再夹到整句内；**没判出语音时为空**（不退回整句） | ASR、声纹 |
+
+`usable_for` 是**下限式**判定：只在明显不该跑时拦，其余放行并把原因挂在字段上，
+不让下游对着一个布尔值猜。
+
+| 任务 | 放行条件 | 否则 | 理由 |
+|------|----------|------|------|
+| `separation` | 无正空洞且整句非空 | `hole_+Nms` / `empty` | 补零是假样本，分离模型会在上面凭空造出一个「源」 |
+| `asr` | 语音视图非空 | `no_speech` | 截断/空洞不拦：有多少字转多少字，比整句丢掉好 |
+| `voiceprint` | 语音 ≥ `min_voiceprint_ms`（默认 1000）且 `not suspect` | `short_Nms` / 首个 suspect 原因 | 短音频与含伪影音频的说话人嵌入极不稳 |
+
+`suspect_reasons` 汇总不可信来源：片 `status != clean`（`seg#N_gap` / `seg#N_clamped`）、
+正空洞 `hole_+Nms`、重叠 `overlap_Nms`、被新句顶掉 `aborted`、未收尾 `incomplete`、
+语音区间内含补零 `zeroed_in_speech_Nms`。视图上的时间换算唯一：`ms_to_index` /
+`index_to_ms` 互逆且都按样本数取整（越界夹住而不是报错），补零区间随视图一起裁剪
+（`zeroed_spans_ms`），`slice_ms()` 可再切固定窗口，`to_numpy()` 出 float32 ±1.0，
+`json()` 只出元信息不含波形。只对**已收尾**的整句调用——对在途句子打包会和采集线程的
+`append()` 抢同一份波形，读到半截 PCM。
 
 背压与内存：`take()` 队列有界（`max_queued`，满了丢最旧并计数），消费线程写盘/跑 ASR
 都不会回头拖住采集线程；会话结束时 `close_pending()` 把没等到收尾片的在途整句
@@ -655,7 +681,7 @@ R3 只说"开始启动为空闲"。mic 上电 pop 音、首次噪声底噪未估
 | TC11 | 消费队列塞满 | `D` 仍前进、无异常、`backpressure_drop++`（G11） |
 | TC12 | `ring_capacity=6000, max_utterance=5000` | 启动 `assert` 失败（G5） |
 
-实现期新增（同一文件内，逐条对应上面「补全」里立的规矩；`test_segment.py` 共 54 个用例）：
+实现期新增（同一文件内，逐条对应上面「补全」里立的规矩；`test_segment.py` 共 61 个用例）：
 
 | # | 输入 | 期望 | 覆盖 |
 |---|------|------|------|
@@ -672,10 +698,15 @@ R3 只说"开始启动为空闲"。mic 上电 pop 音、首次噪声底噪未估
 | TC20 | 段尾贴窗 vs 段尾远离窗尾 | 前者窗尾必须为语音，后者必须落到静音 | G19 |
 | TC21 | `SPEAKING` 中跌进 `[prob_end, prob_start)` 中间带 | 不提前闭合；`IDLE` 侧中间带不起口 | G13 |
 
-派发**之后**的整句装配层（§5.6.1）另加 14 条 `TestUtteranceAssembly`：硬截断链拼回整句且片序不错位、
+派发**之后**的整句装配层（§5.6.1）另加 21 条 `TestUtteranceAssembly`：硬截断链拼回整句且片序不错位、
 partial 只作预览不入波形、正空洞补零并记 `Hole`、负重叠裁头、没等到收尾片则 `aborted`、
 逐帧细节数组与 `block_ms` 栅格对齐、`trim_to_speech` 用 VAD 边界、队列溢出丢最旧、
 广播出口任一拒收要如实报背压，最后一条把装配器挂在**真状态机**上做 6.2 s 语音的端到端校验。
+交付载荷（`to_bundle`）占其中 7 条：一句干净话三个任务全放行且 `speech` 视图逐字节等于
+`full` 视图的对应切片、正空洞只拦 `separation` 不拦 `asr`、重叠裁头后 `separation` 仍可用、
+语音短于 `min_voiceprint_ms` 时 `voiceprint=short_Nms`、没有 VAD 语音时 `speech` 视图为空
+（`asr=no_speech` 而不是偷偷喂整句）、片 `status=gap` 必须挂进 `suspect_reasons`、
+以及视图的 `ms_to_index ↔ index_to_ms` 互逆 / `slice_ms` 越界报错 / `json()` 不含波形。
 
 采集侧接缝（§9.2「起流积压清空」）另加 3 条 `TestCaptureDrain`：用带块编号的 PCM 断言 `pump()`
 在拿到第一个块之前就把积压丢掉（状态机只见到「当前时刻」的块）、积压期间的丢弃计数被结转到

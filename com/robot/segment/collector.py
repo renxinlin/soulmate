@@ -19,7 +19,7 @@
   **不参与拼接**，只挂到 :attr:`Utterance.preview`。
 * 收尾判定：``close_reason != MAX_DURATION`` 的那一片才算这句说完。
 
-三个数据出口
+四个数据出口
 ------------
 1. :meth:`Utterance.pcm` / :meth:`Utterance.to_int16` / :meth:`Utterance.to_numpy`
    —— 整句波形数组；
@@ -27,6 +27,9 @@
    （每帧 rms/peak 电平、是否落在 VAD 语音区间、是否落在补零空洞）；
 3. :meth:`Utterance.trim_to_speech` —— 按 VAD 的 ``speech_start_ms`` /
    ``last_speech_ms`` 裁掉首尾静音，这才是真正该送 ASR 的那一段。
+4. :meth:`Utterance.to_bundle` —— 上面三个出口**一次打包**成
+   :class:`UtteranceBundle`：整句 / 语音两个 :class:`AudioView` + 判决与完整性元信息
+   + ``usable_for`` 任务可用性判定，直接交给语音分离 / ASR / 声纹（文档 §5.6.1）。
 
 线程模型
 --------
@@ -44,11 +47,11 @@ import threading
 import time
 import wave
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from .dispatcher import ISegmentDispatcher
-from .models import CloseReason, Segment
+from .models import CloseReason, SampleStatus, Segment
 
 #: 只有硬截断片需要续接；其余闭合原因都表示「这句说完了」
 _OPEN_REASON = CloseReason.MAX_DURATION
@@ -100,6 +103,211 @@ def _levels(samples: Sequence[int]) -> Tuple[float, float]:
     rms = math.sqrt(acc / len(samples))
     return (20.0 * math.log10(rms / 32768.0) if rms > 1.0 else -120.0,
             20.0 * math.log10(peak / 32768.0))
+
+
+# ======================================================================
+# 交付给下游任务的载荷：一次解码、多视图
+# ======================================================================
+@dataclass(frozen=True)
+class AudioView:
+    """一段可以直接喂给模型的音频：int16 单声道样本 + 它在会话时间轴上的位置。
+
+    ``samples`` 是整句波形的**切片副本**，视图交出后采集线程不会再动它，
+    因此可以安全跨线程传递、持有、送模型；但它是可变的 ``array('h')``，
+    约定**只读**——就地修改不会回写到整句，需要预处理（降噪/重采样）请另建数组。
+
+    时间换算一律走 :meth:`ms_to_index` / :meth:`index_to_ms`，
+    两者互逆且都按样本数取整，所以「数组下标 ↔ 绝对毫秒」在整条链路上唯一。
+    """
+
+    source: str                                  # "full" 整句 | "speech" 裁到语音
+    samples: array.array                         # int16 mono
+    sample_rate: int
+    start_ms: int                                # 视图起点的会话绝对毫秒
+    zeroed_spans_ms: Tuple[Tuple[int, int], ...] = ()   # 落在本视图内的补零区间（绝对毫秒）
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    @property
+    def n_samples(self) -> int:
+        return len(self.samples)
+
+    @property
+    def end_ms(self) -> int:
+        return self.start_ms + self.duration_ms
+
+    @property
+    def duration_ms(self) -> int:
+        return len(self.samples) * 1000 // self.sample_rate
+
+    @property
+    def pcm(self) -> bytes:
+        """int16 LE 字节流（写 wav / 喂只认 bytes 的接口时用）。"""
+        return self.samples.tobytes()
+
+    def to_numpy(self, normalize: bool = True):
+        """模型输入最常见的形态：``float32``、满量程归一到 ±1.0。
+
+        numpy 惰性导入：不用它的调用方（纯 stdlib 链路、单测）不受影响。
+        """
+        import numpy as np
+
+        a = np.frombuffer(self.pcm, dtype=np.int16)
+        return a.astype(np.float32) / 32768.0 if normalize else a
+
+    def level_db(self) -> Tuple[float, float]:
+        """整段 ``(rms_db, peak_db)``，用于快速判断这段值不值得跑模型。"""
+        return _levels(self.samples)
+
+    def ms_to_index(self, abs_ms: int) -> int:
+        idx = (abs_ms - self.start_ms) * self.sample_rate // 1000
+        return max(0, min(self.n_samples, idx))
+
+    def index_to_ms(self, idx: int) -> int:
+        return self.start_ms + idx * 1000 // self.sample_rate
+
+    def slice_ms(self, lo_ms: int, hi_ms: int) -> "AudioView":
+        """按绝对毫秒再切一刀（分离模型常要求固定长度窗口时用）。"""
+        i0, i1 = self.ms_to_index(lo_ms), self.ms_to_index(hi_ms)
+        if i1 <= i0:
+            raise ValueError("切片为空：%d~%dms 不在 [%d,%d) 内"
+                             % (lo_ms, hi_ms, self.start_ms, self.end_ms))
+        return AudioView(source=self.source + "[%d,%d]" % (lo_ms, hi_ms),
+                         samples=self.samples[i0:i1], sample_rate=self.sample_rate,
+                         start_ms=self.index_to_ms(i0),
+                         zeroed_spans_ms=_clip_spans(self.zeroed_spans_ms, lo_ms, hi_ms))
+
+    def has_zeroed(self, lo_ms: Optional[int] = None, hi_ms: Optional[int] = None) -> bool:
+        """区间内是否含补零（即非真实采集的音频）；不给参数就是整段。"""
+        if lo_ms is None and hi_ms is None:
+            return bool(self.zeroed_spans_ms)
+        lo = self.start_ms if lo_ms is None else lo_ms
+        hi = self.end_ms if hi_ms is None else hi_ms
+        return any(x < hi and y > lo for x, y in self.zeroed_spans_ms)
+
+    def as_dict(self) -> Dict[str, object]:
+        """元信息（**不含波形**），可直接进 JSONL。"""
+        return {"source": self.source, "n_samples": self.n_samples,
+                "start_ms": self.start_ms, "end_ms": self.end_ms,
+                "duration_ms": self.duration_ms, "sample_rate": self.sample_rate,
+                "zeroed_spans_ms": [list(x) for x in self.zeroed_spans_ms]}
+
+
+@dataclass(frozen=True)
+class UtteranceBundle:
+    """一句完整话的**交付载荷**：波形 + 语音段 + 判决与完整性元信息 + 任务可用性判定。
+
+    设计取向（给语音分离 / ASR / 声纹这类下游任务用）：
+
+    * **一次解码**：:meth:`Utterance.to_bundle` 只把整句 PCM 解一次，两个视图都从
+      同一份数组切出来；调用方再取 `pcm` / `to_numpy` 都是在这份数据上加工，
+      不会重复付 O(N) 的代价。
+    * **两个视图**：`full` 是含 pre/post_roll 与首尾静音的整句（分离模型通常要这个，
+      上下文静音对它有用）；`speech` 是按 VAD 边界裁过的（ASR / 声纹要的）。
+    * **诚实的完整性**：`suspect` / `suspect_reasons` / `usable_for` 把「这段音频能不能
+      信」讲明白。空洞一律补零以保住时间映射，但补零处不是真声，声纹这种对伪影
+      敏感的任务必须先看这个字段再跑。
+    * 判定规则写在 :meth:`Utterance.to_bundle` 里，是**下限式**的：只在明显不该跑时拦，
+      拿不准就放行并把原因挂在 `usable_for` 上，别让下游任务对着一个布尔值猜。
+    """
+
+    utterance_id: int
+    tag: str
+    sample_rate: int
+    channels: int
+    full: AudioView
+    speech: AudioView
+    start_ms: int
+    end_ms: int
+    duration_ms: int
+    speech_start_ms: int
+    speech_end_ms: int
+    speech_duration_ms: int
+    n_parts: int
+    seq_first: int
+    seq_last: int
+    complete: bool
+    aborted: bool
+    close_reason: Optional[str]
+    contiguous: bool
+    hole_ms: int
+    holes: Tuple[Hole, ...]
+    zeroed_spans_ms: Tuple[Tuple[int, int], ...]
+    suspect: bool
+    suspect_reasons: Tuple[str, ...]
+    vad_confidence: float
+    peak_level_db: float
+    mean_level_db: float
+    noise_floor_db: float
+    decision_ms: int
+    usable_for: Dict[str, str] = field(default_factory=dict)
+    frames: Optional[Tuple[FrameDetail, ...]] = None
+
+    def audio(self, which: str = "full") -> AudioView:
+        """``which="full"`` 整句 / ``"speech"`` 语音段；别的值直接报错，不静默兜底。"""
+        if which == "full":
+            return self.full
+        if which == "speech":
+            return self.speech
+        raise ValueError("音频视图只有 full / speech，收到 %r" % (which,))
+
+    def usable(self, task: str) -> bool:
+        """该任务是否可以拿这份载荷直接开跑。"""
+        return self.usable_for.get(task) == "ok"
+
+    def as_dict(self, with_frames: bool = False) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "utterance_id": self.utterance_id, "tag": self.tag or None,
+            "sample_rate": self.sample_rate, "channels": self.channels,
+            "start_ms": self.start_ms, "end_ms": self.end_ms,
+            "duration_ms": self.duration_ms,
+            "speech_span_ms": [self.speech_start_ms, self.speech_end_ms],
+            "speech_duration_ms": self.speech_duration_ms,
+            "n_parts": self.n_parts, "seq": [self.seq_first, self.seq_last],
+            "complete": self.complete, "aborted": self.aborted,
+            "close_reason": self.close_reason,
+            "contiguous": self.contiguous, "hole_ms": self.hole_ms,
+            "holes": [{"from_seg": h.from_seg, "to_seg": h.to_seg, "gap_ms": h.gap_ms}
+                      for h in self.holes],
+            "zeroed_spans_ms": [list(x) for x in self.zeroed_spans_ms],
+            "suspect": self.suspect, "suspect_reasons": list(self.suspect_reasons),
+            "vad_confidence": self.vad_confidence,
+            "peak_level_db": round(self.peak_level_db, 1),
+            "mean_level_db": round(self.mean_level_db, 1),
+            "noise_floor_db": self.noise_floor_db,
+            "decision_ms": self.decision_ms,
+            "usable_for": dict(self.usable_for),
+            "views": {"full": self.full.as_dict(), "speech": self.speech.as_dict()},
+        }
+        if with_frames and self.frames is not None:
+            out["frames"] = [f.as_dict() for f in self.frames]
+        return out
+
+    def json(self, with_frames: bool = False) -> str:
+        return json.dumps(self.as_dict(with_frames), ensure_ascii=False)
+
+    def summary(self) -> str:
+        return ("utt#%d%s [%d,%d] %dms 语音%dms 片%d %s%s 可用性%s" % (
+            self.utterance_id, ("@" + self.tag) if self.tag else "",
+            self.start_ms, self.end_ms, self.duration_ms, self.speech_duration_ms,
+            self.n_parts, self.close_reason or "open",
+            "/aborted" if self.aborted else "",
+            " ".join("%s:%s" % (k, v) for k, v in sorted(self.usable_for.items())) or "-"))
+
+    def __str__(self) -> str:
+        return self.summary()
+
+
+def _clip_spans(spans: Tuple[Tuple[int, int], ...], lo_ms: int,
+                hi_ms: int) -> Tuple[Tuple[int, int], ...]:
+    """把补零区间裁到 ``[lo_ms, hi_ms)`` 内；完全落在外面的丢掉。"""
+    out = []
+    for x, y in spans:
+        a, b = max(x, lo_ms), min(y, hi_ms)
+        if b > a:
+            out.append((a, b))
+    return tuple(out)
 
 
 # ======================================================================
@@ -270,6 +478,123 @@ class Utterance:
                 zeroed=any(x < hi and y > lo for x, y in self._zero_spans)))
         self._frame_cache[frame_ms] = out
         return out
+
+    # ------------------------------------------------------------------ 交付载荷
+    def to_bundle(self, pad_ms: int = 40, frame_ms: int = 32, with_frames: bool = False,
+                  min_voiceprint_ms: int = 1000) -> UtteranceBundle:
+        """打包整句：完整波形 + 语音段 + 元信息 + 各下游任务的可用性判定。
+
+        用途就是把「一句完整话」一次性交给语音分离 / ASR / 声纹，调用方不用再
+        自己拼 ``trim_to_speech`` + ``manifest`` + 空洞判断这套重复代码。
+
+        Parameters
+        ----------
+        pad_ms            : 语音段视图在 VAD 边界外保留的余量（给辅音头尾，别用 0）。
+        frame_ms          : 逐帧细节栅格；传 ``SegmentConfig.block_ms`` 才能对回状态机帧序。
+        with_frames       : 是否顺带算好逐帧细节数组（声纹/分离想做帧级筛选用）。
+        min_voiceprint_ms : 语音短于它就不跑声纹——短音频的说话人嵌入极不稳。
+
+        视图切法
+        --------
+        ``full``   = ``[parts[0].start_ms, parts[-1].end_ms)``，含 pre/post_roll、含补零空洞，
+                     分离模型要的「带上下文的整句」。
+        ``speech`` = ``[speech_start - pad, speech_end + pad]`` 再夹到整句范围内，
+                     VAD 判出的语音外包络，ASR / 声纹要的「只有人声的那段」。
+                     **没有任何 VAD 语音时它是空的**（不是退回整句），
+                     这样下游看 ``speech_duration_ms == 0`` 就知道该跳过。
+
+        可用性判定（下限式：只在明显不该跑时拦，其余把原因挂在字段上）
+        --------------------------------------------------------------
+        separation : ``ok`` 需无正空洞（补零会让分离模型凭空造一个「源」）且整句非空；
+                     否则 ``hole_+Nms`` / ``empty``。被截断不影响——分离本来就按窗口算。
+        asr        : ``ok`` 需语音视图非空；否则 ``no_speech``。
+                     截断/空洞**不拦**：有多少字转多少字，比整句丢掉好，
+                     真伪靠 ``suspect`` / ``zeroed_spans_ms`` 自查。
+        voiceprint : ``ok`` 需 ``speech_duration_ms >= min_voiceprint_ms``
+                     且 ``not suspect``（干净、非截断、语音区间内无补零）；
+                     否则 ``short_Nms`` / 首个 suspect 原因。
+
+        只对**已收尾**的整句调用（:meth:`UtteranceAssembler.take` 拿到的那些）：
+        对在途句子（:meth:`UtteranceAssembler.current`）打包会和采集线程的
+        ``append`` 抢同一份波形，读到的可能是半截 PCM。
+        """
+        sr = self.sample_rate
+        samples = self.to_int16()                                  # 全句只解码这一次
+        spans = tuple(self._zero_spans)                            # 绝对毫秒
+        u0, u1 = self.start_ms, self.end_ms
+        full = AudioView("full", samples, sr, u0, _clip_spans(spans, u0, u1))
+
+        voice = self.speech_spans_ms()
+        if voice:
+            i0 = self.ms_to_index(voice[0][0] - pad_ms)
+            i1 = self.ms_to_index(voice[-1][1] + pad_ms)
+            sp_lo, sp_hi = self.speech_span_ms()
+        else:
+            i0 = i1 = 0
+            sp_lo = sp_hi = 0
+        if i1 < i0:                                                # pad 把区间夹反时兜底
+            i0 = i1 = 0
+        s_start = self.index_to_ms(i0)
+        s_end = self.index_to_ms(i1)
+        speech = AudioView("speech", samples[i0:i1], sr, s_start,
+                           _clip_spans(spans, s_start, s_end) if i1 > i0 else ())
+
+        pos_holes = tuple(h.gap_ms for h in self.holes if h.gap_ms > 0)
+        overlaps = tuple(-h.gap_ms for h in self.holes if h.gap_ms < 0)
+        reasons: List[str] = []
+        for s in self.parts:
+            if s.status is not SampleStatus.CLEAN:
+                reasons.append("seg#%d_%s" % (s.seg_id, s.status.value))
+        if pos_holes:
+            reasons.append("hole_+%dms" % sum(pos_holes))
+        if overlaps:
+            reasons.append("overlap_%dms" % sum(overlaps))
+        if self.aborted:
+            reasons.append("aborted")
+        if not self.complete:
+            reasons.append("incomplete")
+        if speech.has_zeroed():
+            reasons.append("zeroed_in_speech_%dms"
+                           % sum(y - x for x, y in speech.zeroed_spans_ms))
+        suspect = bool(reasons)
+
+        parts = self.parts
+        dur_all = sum(s.duration_ms for s in parts) or 1
+        peak = max([float(s.meta.get("peak_level_db", -120.0)) for s in parts] or [-120.0])
+        mean = sum(float(s.meta.get("mean_level_db", -120.0)) * s.duration_ms
+                   for s in parts) / dur_all
+        conf = sum(s.vad_confidence * s.duration_ms for s in parts) / dur_all
+        if speech.duration_ms < min_voiceprint_ms:
+            voiceprint = "short_%dms" % speech.duration_ms
+        elif suspect:
+            voiceprint = reasons[0]
+        else:
+            voiceprint = "ok"
+        usable = {
+            "separation": "ok" if (full.n_samples and not pos_holes) else (
+                "empty" if not full.n_samples else "hole_+%dms" % sum(pos_holes)),
+            "asr": "ok" if speech.n_samples else "no_speech",
+            "voiceprint": voiceprint,
+        }
+
+        return UtteranceBundle(
+            utterance_id=self.utterance_id, tag=self.tag, sample_rate=sr, channels=1,
+            full=full, speech=speech, start_ms=u0, end_ms=u1,
+            duration_ms=self.duration_ms,
+            speech_start_ms=sp_lo, speech_end_ms=sp_hi,
+            speech_duration_ms=speech.duration_ms,
+            n_parts=len(parts),
+            seq_first=parts[0].seq_in_utterance if parts else -1,
+            seq_last=parts[-1].seq_in_utterance if parts else -1,
+            complete=self.complete, aborted=self.aborted, close_reason=self.close_reason,
+            contiguous=self.contiguous, hole_ms=self.hole_ms, holes=tuple(self.holes),
+            zeroed_spans_ms=spans, suspect=suspect, suspect_reasons=tuple(reasons),
+            vad_confidence=round(conf, 3), peak_level_db=peak, mean_level_db=round(mean, 1),
+            noise_floor_db=parts[-1].noise_floor_db if parts else -120.0,
+            decision_ms=parts[-1].decision_ms if parts else 0,
+            usable_for=usable,
+            frames=tuple(self.frame_detail(frame_ms)) if with_frames else None,
+        )
 
     # ------------------------------------------------------------------ 出口
     def manifest(self, with_frames: bool = False, frame_ms: int = 32) -> Dict[str, object]:

@@ -18,17 +18,22 @@
     # ASR 线程
     utt = asm.take(timeout=0.2)
     if utt is not None:
-        samples = utt.trim_to_speech()           # 整句 PCM
-        frames = utt.frame_detail(cfg.block_ms)  # 逐帧细节数组
+        b = utt.to_bundle()                    # 交付载荷：整句 + 语音段 + 元信息
+        if b.usable("asr"):
+            run_asr(b.speech.to_numpy())       # float32 ±1.0，已按 VAD 边界裁好
+        b.full.duration_ms                     # 整句（含 pre/post_roll）供分离模型用
+        print(b.json())                        # 落库/日志（不含波形）
 """
 from __future__ import annotations
 
 from .collector import (
+    AudioView,
     BroadcastDispatcher,
     FrameDetail,
     Hole,
     Utterance,
     UtteranceAssembler,
+    UtteranceBundle,
     UtteranceWriter,
 )
 from .config import ConfigError, SegmentConfig
@@ -49,6 +54,7 @@ from .vad import EnergyVad, ISegmentVAD, iter_frames, rms_db
 __all__ = [
     "AudioFrame",
     "AudioRingBuffer",
+    "AudioView",
     "BroadcastDispatcher",
     "Candidate",
     "CallbackDispatcher",
@@ -70,6 +76,7 @@ __all__ = [
     "StaticGate",
     "Utterance",
     "UtteranceAssembler",
+    "UtteranceBundle",
     "UtteranceWriter",
     "iter_frames",
     "rms_db",
