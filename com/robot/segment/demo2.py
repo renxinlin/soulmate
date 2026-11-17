@@ -2,7 +2,7 @@
 """实时采集 demo2：``麦克风 → 通道处理 → 16k 重采样 → 逐帧 VAD → 分段状态机``。
 
 与 ``demo.py``（离线回放一条 16k/mono wav）的差别：这里没有现成的整文件，
-音频是设备持续推来的块，采样率/通道数由设备决定，所以本 demo 额外负责三件
+音频是设备持续推来的块，采样率/通道数由设备决定，所以本 demo 额外负责四件
 属于「采集侧」的事（设计文档 §5.1 / §7-G12）：
 
 1. **通道数**：状态机只吃单声道（``SegmentConfig.validate`` 强制 ``channels == 1``），
@@ -20,6 +20,10 @@
    **不是墙钟、也不是缓冲区下标**。采集端丢块时故意把时钟推前，让状态机
    看见真实空洞并触发 ``gap_force_close``（文档 §7-G12），
    而不是把丢掉的音频假装没发生过。
+4. **起流积压**：``with src`` 起流到 ``pump()`` 开吃之间要先加载 VAD 模型
+   （FSMN 首次几秒），这期间回调照常往队列塞数据。``pump()`` 进循环前先
+   ``src.drain_pending()``：丢掉这段旧数据、并把起流期间的丢弃计数移到独立计数上，
+   于是状态机看到的第一帧就是**当前时刻**的语音，看板上的「丢弃」也只反映会话内。
 
 用法::
 
@@ -42,7 +46,9 @@ FSMN 是**段输出型**判决，经 :class:`WindowSegmentVad` 摊成逐帧概�
 
 按 Ctrl-C 停止采集，会把在途段闭合（EOS）后打印完整报告。
 麦克风依赖 ``sounddevice``（PortAudio）；要换 ``pyaudio`` 只需再写一个产出
-``(interleaved_int16_bytes, frames)`` 的 source，其余链路不变。
+``(interleaved_int16_bytes, frames)`` 的 source，其余链路不变。实时源建议再实现
+``drain_pending() -> (blocks, frames)``（见 :func:`pump`），没实现也不会报错，
+只是失去「起流积压清零」这一层保护。
 """
 from __future__ import annotations
 
@@ -278,6 +284,7 @@ class MicSource:
         import sounddevice as sd  # 惰性导入：headless 环境仍能跑 --input wav/sim
 
         self.dropped_frames = 0
+        self.startup_dropped = 0          # 起流→开吃之间被 drain_pending 丢掉的帧数
         self.overruns = 0
         self.realtime = True
         self._q: queue.Queue = queue.Queue(maxsize=max(2, args.qsize))
@@ -314,6 +321,34 @@ class MicSource:
     def __enter__(self) -> "MicSource":
         self._stream.start()
         return self
+
+    def drain_pending(self) -> Tuple[int, int]:
+        """丢掉队列里已积压的块，让后续取到的是**当前时刻**的音频。
+
+        必须清：``__enter__`` 起流到 :func:`pump` 开吃之间隔着 ``make_pipelines``
+        ——FSMN/Silero 首次加载可能好几秒，这期间回调照常跑，队列（``--qsize`` 块，
+        默认 0.5s）里全是这段时间的旧数据。不清空就有两个后果：
+
+        * 状态机先处理 0.5s **前**的语音，真话被推后同样 0.5s 才进判决——刚唤醒就
+          答非所问，且这段旧数据里若含上一句尾巴，还会被当成新会话的第一段派发出去；
+        * 积压期间记下的 ``dropped_frames`` / ``overruns`` 混进会话统计，看板上
+          「丢弃 N 次」虚高，分不清是起流抖动还是真跑起来后消费端跟不上。
+
+        返回 ``(块数, 帧数)``；计数清零，起流那部分另记在 :attr:`startup_dropped`，
+        可观测性不丢。
+        """
+        blocks = frames = 0
+        while True:
+            try:
+                _, n = self._q.get_nowait()
+            except queue.Empty:
+                break
+            blocks += 1
+            frames += int(n)
+        self.startup_dropped += frames
+        self.dropped_frames = 0
+        self.overruns = 0
+        return blocks, frames
 
     def blocks(self) -> Iterator[Tuple[bytes, int]]:
         while not self._stop.is_set():
@@ -522,11 +557,23 @@ def pump(src, segs: List[Segmenter], dm: Optional[Downmix], args: argparse.Names
     见模块 docstring 与文档 §5.1：循环里的时间坐标一律是**音频时钟**，
     丢块只推时钟不喂数据，让状态机自己看见空洞（文档 §7-G12）。
 
+    进循环前先 ``drain_pending()``：起流（``__enter__``）到这里之间可能已经过了几秒
+    （加载 VAD 模型），队列里全是旧数据。丢掉它们，后续处理的才是**当前时刻**的语音；
+    起流期间的丢弃/溢出也移到独立计数上，不再污染会话内的 ``丢弃=N 次``。
+    source 没实现该方法就跳过（自定义源的最小契约只有 ``blocks()``）。
+
     墙钟基准 ``t0`` 在**第一个块到达时**才起算（而不是进入循环前）：设备打开、
     PortAudio 起流、文件首块读盘都可能耗掉几十到几百毫秒，若从 ``pump()`` 入口
     起算，心跳里的「采集 X.Xs / 漂移」和 ``--duration`` 都会被这段空白污染。
     """
     nch = src.channels
+    drain = getattr(src, "drain_pending", None)      # 起流期间攒下的旧数据先丢掉
+    if drain is not None:
+        blocks, frames = drain()
+        if frames and not args.quiet:
+            print("[%s] 丢弃起流积压 %d 块 / %.0fms，从当前时刻的语音开始处理"
+                  % (getattr(src, "device_name", "src"), blocks,
+                     frames * 1000.0 / src.rate), flush=True)
     seen_drops = getattr(src, "dropped_frames", 0)
     t0: Optional[float] = None        # 首个块的到达时刻；None = 还没来数据
     last_beat = 0.0
@@ -591,9 +638,10 @@ def run(args: argparse.Namespace) -> int:
             print("\n通道选择：当前=%s 切换次数=%d 末块电平=%s" % (
                 dm.sel, dm.switches,
                 ["%.0fdB" % v for v in dm.levels] if dm.levels else "n/a"))
-    print("\n采集帧=%d（%.2fs）丢弃=%d 次 overruns=%d" % (
+    print("\n采集帧=%d（%.2fs）丢弃=%d 次 overruns=%d 起流丢弃=%d 帧" % (
         stats["frames"], stats["frames"] / float(src.rate),
-        getattr(src, "dropped_frames", 0), getattr(src, "overruns", 0)))
+        getattr(src, "dropped_frames", 0), getattr(src, "overruns", 0),
+        getattr(src, "startup_dropped", 0)))
     print(json.dumps({"pipelines": [
         {"name": s.name, "audio_ms": s.total_ms, "dropped_16k_frames": s.dropped_16k,
          "segments": len(s.segments), "final": sum(1 for x in s.segments if x.is_final),

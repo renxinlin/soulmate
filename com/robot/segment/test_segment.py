@@ -16,6 +16,10 @@
 ``TestUtteranceAssembly`` 覆盖的是**派发之后**的整句装配层（``collector.py``，文档 §5.6）：
 硬截断拼接、partial 不入波形、空洞补零 / 重叠裁头、逐帧细节数组、队列溢出，
 其中一条端到端用例直接把装配器挂在真状态机出口上。
+
+``TestCaptureDrain`` 覆盖的是**派发之前**的采集侧接缝（``demo2.pump``，文档 §9.2）：
+起流期间攒下的积压必须在第一个块之前丢掉，于是状态机处理的是「当前时刻」的语音，
+积压期间的丢弃计数也不会混进会话统计。
 """
 from __future__ import annotations
 
@@ -803,6 +807,105 @@ class TestUtteranceAssembly(unittest.TestCase):
         # PCM 来自环形缓冲：每块首样本编码了该块的起始毫秒（见文件 docstring）
         self.assertEqual(utt.to_int16()[0], utt.start_ms)
         self.assertEqual(asm.close_pending(), [])                        # 没有半截在途句
+
+
+def _tagged_pcm(tag: int, frames: int = 160) -> bytes:
+    """首样本写「块编号」的 PCM，便于断言状态机到底吃到了哪几块。"""
+    a = array.array("h", [0]) * frames
+    a[0] = tag
+    return a.tobytes()
+
+
+class _Recorder:
+    """替 ``pump()`` 记它到底喂了哪些块、有没有被要求跳时钟。"""
+
+    def __init__(self) -> None:
+        self.tags = []
+        self.skips = []
+        self.dispatched = 0
+        self.total_ms = 0
+
+    def feed(self, a) -> None:
+        self.tags.append(a[0])
+
+    def skip(self, frames: int) -> None:
+        self.skips.append(frames)
+
+
+class _BacklogSource:
+    """起流后、``pump()`` 开吃前已经攒了 3 块旧数据（tag 1..3），之后才是新数据（101..）。"""
+
+    realtime, channels, rate, device_name = True, 1, 16000, "backlog-src"
+
+    def __init__(self, with_drain: bool = True) -> None:
+        self._pending = [_tagged_pcm(i) for i in (1, 2, 3)]     # 模型加载期间的积压
+        self._fresh = [_tagged_pcm(i) for i in (101, 102)]
+        self.dropped_frames = 3 * 160                           # 队列满，回调丢了 3 块
+        self.overruns = 1
+        self.startup_dropped = 0
+        if with_drain:                                          # 第三方源可以不实现它
+            self.drain_pending = self._drain
+
+    def __enter__(self) -> "_BacklogSource":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+    def _drain(self):
+        n = len(self._pending)
+        self._pending = []
+        self.startup_dropped += self.dropped_frames
+        self.dropped_frames = self.overruns = 0
+        return n, n * 160
+
+    def blocks(self):
+        for pcm in self._pending + self._fresh:
+            yield pcm, 160
+
+
+class TestCaptureDrain(unittest.TestCase):
+    """采集侧接缝（demo2）：起流积压必须在第一个块之前被丢掉（文档 §9.2）。"""
+
+    def _pump(self, src):
+        import argparse
+
+        from com.robot.segment.demo2 import pump
+
+        rec = _Recorder()
+        args = argparse.Namespace(quiet=True, no_heartbeat=True, duration=0)
+        stats = pump(src, [rec], None, args)
+        return rec, stats
+
+    def test_pump_discards_startup_backlog(self):
+        src = _BacklogSource()
+        rec, stats = self._pump(src)
+        self.assertEqual(rec.tags, [101, 102])                   # 只处理当前时刻之后的块
+        self.assertEqual(rec.skips, [])                          # 积压没被当成会话内空洞
+        self.assertEqual((src.dropped_frames, src.overruns), (0, 0))
+        self.assertEqual(src.startup_dropped, 480)               # 起流那部分另记一笔
+        self.assertEqual(stats["frames"], 320)
+
+    def test_source_without_drain_pending_still_works(self):
+        src = _BacklogSource(with_drain=False)
+        rec, _ = self._pump(src)
+        self.assertEqual(rec.tags, [1, 2, 3, 101, 102])          # 最小契约只有 blocks()
+        self.assertEqual(src.startup_dropped, 0)                 # 只是失去这层保护
+
+    def test_mic_drain_clears_queue_and_moves_counters(self):
+        import queue
+
+        from com.robot.segment.demo2 import MicSource
+
+        ms = MicSource.__new__(MicSource)                        # 绕开 sounddevice，只测队列语义
+        ms._q = queue.Queue()
+        for _ in range(3):
+            ms._q.put((_tagged_pcm(0), 160))
+        ms.dropped_frames, ms.overruns, ms.startup_dropped = 500, 2, 0
+        self.assertEqual(ms.drain_pending(), (3, 480))
+        self.assertTrue(ms._q.empty())
+        self.assertEqual((ms.dropped_frames, ms.overruns), (0, 0))
+        self.assertEqual(ms.startup_dropped, 480)
 
 
 def main() -> int:

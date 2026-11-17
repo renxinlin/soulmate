@@ -296,9 +296,10 @@ def run(args: argparse.Namespace) -> int:
         p.stop()
 
     total_ms = max([s.total_ms for s in segs] or [0])
-    print("\n采集 %d 帧（%.2fs，音频时钟 %.2fs）丢弃=%d 次 墙钟=%.1fs" % (
+    print("\n采集 %d 帧（%.2fs，音频时钟 %.2fs）丢弃=%d 次 起流丢弃=%d 帧 墙钟=%.1fs" % (
         stats["frames"], stats["frames"] / float(src.rate), total_ms / 1000.0,
-        getattr(src, "dropped_frames", 0), stats["wall_ms"] / 1000.0))
+        getattr(src, "dropped_frames", 0), getattr(src, "startup_dropped", 0),
+        stats["wall_ms"] / 1000.0))
     for p in pipes:
         st = p.stats()
         print("  %-12s 片=%s 整句=%s 预览=%s 空洞=%s 队列丢=%s 强制交付=%s 出口错=%s" % (
