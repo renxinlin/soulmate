@@ -24,12 +24,21 @@
 用法::
 
     python -m com.robot.segment.demo2 --list-devices
-    python -m com.robot.segment.demo2                            # 默认麦克风 + 能量 VAD
+    python -m com.robot.segment.demo2                            # 默认麦克风 + FSMN-VAD
+    python -m com.robot.segment.demo2 --vad energy                # 免依赖，只看分段逻辑
     python -m com.robot.segment.demo2 --channels 2 --mix energy --out /tmp/seg
     python -m com.robot.segment.demo2 --channels max --mix multi --duration 30
     python -m com.robot.segment.demo2 --vad sherpa --silero-model /path/silero_vad.onnx
+    python -m com.robot.segment.demo2 --funasr-model funasr/fsmn-vad          # 默认值
+    python -m com.robot.segment.demo2 --funasr-model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
     python -m com.robot.segment.demo2 --input wav 48k_2ch.wav    # 真录音走同一条实时链路
-    python -m com.robot.segment.demo2 --input sim --channels 4   # 无麦克风容器/CI 自测
+    python -m com.robot.segment.demo2 --input sim --channels 4 --vad energy   # 无麦克风容器/CI 自测
+
+``--vad`` 默认 ``fsmn``（与 ``com/robot/models/asr/asr.py`` 同源的那套 FSMN-VAD），
+模型 id 默认取 HF hub 上的 ``funasr/fsmn-vad``；国内网络或板子上改用 ModelScope 的
+``iic/speech_fsmn_vad_zh-cn-16k-common-pytorch``（同一份权重，见文档 §9.1 对照）。
+FSMN 是**段输出型**判决，经 :class:`WindowSegmentVad` 摊成逐帧概率，固有滞后
+``stride − block = 480ms`` 必须被 ``--vad-lag`` 覆盖，否则启动时会打 warning（文档 §7-G19）。
 
 按 Ctrl-C 停止采集，会把在途段闭合（EOS）后打印完整报告。
 麦克风依赖 ``sounddevice``（PortAudio）；要换 ``pyaudio`` 只需再写一个产出
@@ -652,10 +661,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prob-end", type=float, default=0.35)
     p.add_argument("--warmup", type=int, default=500)
     p.add_argument("--emit-partial", action="store_true")
-    p.add_argument("--vad", choices=("energy", "sherpa", "fsmn"), default="energy")
+    p.add_argument("--vad", choices=("energy", "sherpa", "fsmn"), default="fsmn",
+                   help="默认 fsmn（与 asr.py 同源的 FSMN-VAD，需 funasr）；"
+                        "无依赖自测用 --vad energy")
     p.add_argument("--threshold-db", type=float, default=-45.0)
     p.add_argument("--silero-model", default="", help="--vad sherpa 的 onnx 路径")
-    p.add_argument("--funasr-model", default="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
+    p.add_argument("--funasr-model", default="funasr/fsmn-vad",
+                   help="funasr AutoModel 的模型 id：HF hub 'funasr/fsmn-vad'，"
+                        "ModelScope 上同权重为 'iic/speech_fsmn_vad_zh-cn-16k-common-pytorch'")
     p.add_argument("--window-ms", type=int, default=1984)
     p.add_argument("--stride-ms", type=int, default=512)
     p.add_argument("--torch-device", default="cpu")
@@ -702,8 +715,9 @@ def main(argv: List[str] = None) -> int:
         return run(args)
     except ImportError as exc:
         print("错误：缺少依赖（%s）。麦克风采集需要 sounddevice；"
-              "--vad sherpa 需要 sherpa-onnx；--vad fsmn 需要 funasr。"
-              "无麦克风环境可用 --input sim 自测。" % exc, file=sys.stderr)
+              "--vad fsmn（默认）需要 funasr；--vad sherpa 需要 sherpa-onnx。"
+              "想零依赖跑通分段逻辑就加 --vad energy，无麦克风环境再加 --input sim。"
+              % exc, file=sys.stderr)
         return 2
     except (ValueError, FileNotFoundError) as exc:
         print("错误：%s" % exc, file=sys.stderr)

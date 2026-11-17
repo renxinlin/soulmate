@@ -32,9 +32,9 @@
 
 用法::
 
-    python3 -m com.robot.segment.demo3 --input sim --duration 14 --utt-out /tmp/utt3
-    python3 -m com.robot.segment.demo3 --input wav /tmp/demo_in.wav --frames --arrays
-    python3 -m com.robot.segment.demo3 --input sim --channels 2 --mix multi  # 每路一个装配器
+    python3 -m com.robot.segment.demo3 --input sim --vad energy --utt-out /tmp/utt3
+    python3 -m com.robot.segment.demo3 --input wav in.wav --vad fsmn --frames --arrays
+    python3 -m com.robot.segment.demo3 --input sim --vad energy --channels 2 --mix multi
 """
 from __future__ import annotations
 
@@ -341,7 +341,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         return run(args)
     except ImportError as exc:
-        print("错误：缺少依赖（%s）。麦克风采集需要 sounddevice；无麦克风环境用 --input sim 自测。"
+        print("错误：缺少依赖（%s）。麦克风采集需要 sounddevice；--vad fsmn（默认）需要 funasr。"
+              "想零依赖跑通整句装配就加 --vad energy，无麦克风环境再加 --input sim。"
               % exc, file=sys.stderr)
         return 2
     except (ValueError, FileNotFoundError) as exc:

@@ -590,7 +590,9 @@ R3 只说"开始启动为空闲"。mic 上电 pop 音、首次噪声底噪未估
 ### G19 — 没有区分两类 VAD 后端，帧概率型与段输出型的延迟口径完全不同【高，实现期必踩】
 状态机的输入是「逐帧语音概率」，但可用后端分两型：
 ① **帧概率型**（silero / 能量）：每帧一个 `[0,1]`，与帧时钟严格同步，闭合延迟就等于 `vad_lag + min_silence`；
-② **段输出型**（FunASR `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch`）：一次输入整窗音频，吐**语音段毫秒区间列表**
+② **段输出型**（FunASR FSMN-VAD，模型 id `funasr/fsmn-vad` @ HF hub，ModelScope 上同权重为
+`iic/speech_fsmn_vad_zh-cn-16k-common-pytorch`；`demo2/demo3` 的 `--funasr-model` 默认取前者）：
+一次输入整窗音频，吐**语音段毫秒区间列表**
 （`value=[[start_ms, end_ms]]`，单位是毫秒——`asr.py` 里专门标注过这个坑），它**不给逐帧概率**。
 
 不区分就会出现三件事：
@@ -702,24 +704,27 @@ docs/segment_pipeline_design.md   # 本文档
 ```
 
 核心逻辑只依赖标准库（`dataclasses/abc/array/math/queue/threading/logging`），
-`numpy / funasr / sherpa_onnx / sounddevice` 全部惰性导入，因此状态机在 RK 板子和 CI 上都能直接跑：
+`numpy / funasr / sherpa_onnx / sounddevice` 全部惰性导入，因此状态机在 RK 板子和 CI 上都能直接跑。
+`--vad` 在 `demo2/demo3` 里默认 **fsmn**（生产口径，需 `funasr`），模型 id 默认
+`funasr/fsmn-vad`；**下面的自测命令一律显式加 `--vad energy`**，这样在无依赖容器里也能跑通：
 
 ```bash
 python -m unittest com.robot.segment.test_segment -v        # 状态机与后端全链路
-python -m com.robot.segment.demo --vad energy in_16k_mono.wav          # 时间轴报告
+python -m com.robot.segment.demo --vad energy in_16k_mono.wav          # 时间轴报告（离线工具默认 energy）
 python -m com.robot.segment.demo --vad fsmn --out /tmp/seg in_16k_mono.wav   # 需要 funasr
 
 python -m com.robot.segment.demo2 --list-devices                       # 看可用麦克风与通道数
-python -m com.robot.segment.demo2                                      # 默认设备实时分段（需 sounddevice）
-python -m com.robot.segment.demo2 --channels 2 --mix energy --out /tmp/seg
-python -m com.robot.segment.demo2 --channels max --mix multi --duration 30
-python -m com.robot.segment.demo2 --input sim --channels 4 --mix multi  # 无麦克风环境自测
+python -m com.robot.segment.demo2                                      # 默认设备 + FSMN-VAD（需 sounddevice+funasr）
+python -m com.robot.segment.demo2 --vad energy                         # 免 funasr，只看状态机
+python -m com.robot.segment.demo2 --funasr-model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
+python -m com.robot.segment.demo2 --channels 2 --mix energy --out /tmp/seg --vad energy
+python -m com.robot.segment.demo2 --channels max --mix multi --duration 30 --vad energy
+python -m com.robot.segment.demo2 --input sim --channels 4 --mix multi --vad energy  # 无麦克风自测
 
 # demo3 = demo2 的采集链路 + §5.6.1 的整句装配层（出口换成 UtteranceAssembler + 消费线程）
-python -m com.robot.segment.demo3 --input sim --utt-out /tmp/utt                 # 整句 wav + manifest.jsonl
-python -m com.robot.segment.demo3 --input wav in_16k_mono.wav --arrays --rows 6   # 逐帧细节数组
-python -m com.robot.segment.demo3 --input wav in_16k_mono.wav --frames            # 帧数组写进 manifest
-python -m com.robot.segment.demo3 --channels max --mix multi --utt-out /tmp/utt   # 每路一个装配器
+python -m com.robot.segment.demo3 --input sim --vad energy --utt-out /tmp/utt   # 整句 wav + manifest.jsonl
+python -m com.robot.segment.demo3 --input wav in_16k_mono.wav --vad fsmn --frames --rows 6
+python -m com.robot.segment.demo3 --channels max --mix multi --vad energy --utt-out /tmp/utt
 ```
 
 ### 9.2 采集侧参数如何落到本文的时间坐标
@@ -777,6 +782,7 @@ WAV 四要素换算（`demo2.py` 负责这一段，状态机不感知）：
 | `MAX_SPEECH_SEC` | 5.0 | `max_utterance_ms` / R5 | 5000 | 一致；本文补了截断点择优与同句归属（§5.5） |
 | `ONGOING_MARGIN_SEC` | 0.25 | `ongoing_margin_ms` | 250 | 一致，但从 `asr.py` 的段列表判读上移到适配器，状态机只看到帧概率 |
 | `parse_vad_result` | 手工解析 `value=[[start,end]]`（毫秒） | `parse_segment_result` + `WindowSegmentVad` | 同单位 | 单位是**毫秒**这个坑保留在注释与 TC19 断言里 |
+| `vad_model = AutoModel(model="iic/…fsmn_vad…")` | ModelScope 模型 id | `--funasr-model` 默认值 | `funasr/fsmn-vad` | 同一份 FSMN-VAD 权重在两个 hub 上的名字。`asr.py` 继续用 ModelScope，`demo2/demo3` 默认走 HF；换 hub 只改这个参数，**判决口径不变**（`window/stride/model_end_silence_ms` 三者才影响口径） |
 | `NEW_SEG_EPS` | 0.10 s（"防重复识别"） | R7-b `S ≥ D` | 精确 | 原型用 100 ms 容差近似「这段是上次之后新出现的」；本文把它变成显式游标，容差不需要了 |
 | `CHUNK_MS` | 100 | `block_ms` | 32 | 100 ms 粒度会让 pre/post_roll（200/100）无法对齐；32 ms = 512 样本 @16k |
 

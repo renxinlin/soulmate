@@ -8,7 +8,7 @@
 
     python -m com.robot.segment.demo --vad energy long_16k_mono.wav
     python -m com.robot.segment.demo --vad energy --emit-partial --out /tmp/seg a.wav
-    python -m com.robot.segment.demo --vad fsmn --funasr-model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch a.wav
+    python -m com.robot.segment.demo --vad fsmn a.wav                       # 需要 funasr
 
 输入必须是 16kHz / 单声道 / 16bit PCM wav，否则先转换::
 
@@ -191,7 +191,8 @@ def run(args: argparse.Namespace) -> int:
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VAD 分段状态机离线回放")
     p.add_argument("wav", help="16kHz/mono/16bit PCM wav")
-    p.add_argument("--vad", choices=("energy", "fsmn"), default="energy")
+    p.add_argument("--vad", choices=("energy", "fsmn"), default="energy",
+                   help="离线报告工具默认 energy（纯标准库）；要与 asr.py 对齐就加 --vad fsmn")
     p.add_argument("--out", default="", help="段 wav 输出目录，留空则不写文件")
     p.add_argument("--sample-rate", type=int, default=16000)
     p.add_argument("--block-ms", type=int, default=32)
@@ -209,7 +210,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--emit-partial", action="store_true", help="流式提前送（§5.7）")
     p.add_argument("--window-ms", type=int, default=1984, help="fsmn：整窗重算长度")
     p.add_argument("--stride-ms", type=int, default=512, help="fsmn：重算步进")
-    p.add_argument("--funasr-model", default="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
+    p.add_argument("--funasr-model", default="funasr/fsmn-vad",
+                   help="HF hub 的 funasr/fsmn-vad；ModelScope 同权重为 iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
     p.add_argument("--device", default="cpu")
     p.add_argument("--width", type=int, default=56, help="时间轴宽度（字符）")
     p.add_argument("-v", "--verbose", action="store_true")
