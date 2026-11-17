@@ -512,13 +512,20 @@ def pump(src, segs: List[Segmenter], dm: Optional[Downmix], args: argparse.Names
 
     见模块 docstring 与文档 §5.1：循环里的时间坐标一律是**音频时钟**，
     丢块只推时钟不喂数据，让状态机自己看见空洞（文档 §7-G12）。
+
+    墙钟基准 ``t0`` 在**第一个块到达时**才起算（而不是进入循环前）：设备打开、
+    PortAudio 起流、文件首块读盘都可能耗掉几十到几百毫秒，若从 ``pump()`` 入口
+    起算，心跳里的「采集 X.Xs / 漂移」和 ``--duration`` 都会被这段空白污染。
     """
     nch = src.channels
     seen_drops = getattr(src, "dropped_frames", 0)
-    t0 = time.monotonic()
+    t0: Optional[float] = None        # 首个块的到达时刻；None = 还没来数据
     last_beat = 0.0
     frames_total = 0
     for pcm, frames in src.blocks():
+        now = time.monotonic()
+        if t0 is None:                     # 只在这一次赋值，之后 now - t0 才是真正的采集时长
+            t0 = now
         frames_total += frames
         lost = getattr(src, "dropped_frames", 0) - seen_drops
         if lost > 0:
@@ -534,7 +541,6 @@ def pump(src, segs: List[Segmenter], dm: Optional[Downmix], args: argparse.Names
         else:
             segs[0].feed(dm.process(chans))
 
-        now = time.monotonic()
         if (src.realtime and not args.quiet and not args.no_heartbeat
                 and now - last_beat >= 1.0):
             last_beat = now
@@ -545,7 +551,8 @@ def pump(src, segs: List[Segmenter], dm: Optional[Downmix], args: argparse.Names
         if src.realtime and args.duration and (now - t0) >= args.duration:
             print("\n到达 --duration %.1fs（墙钟），停止采集" % args.duration, flush=True)
             break
-    return {"frames": frames_total, "wall_ms": int((time.monotonic() - t0) * 1000)}
+    wall_ms = 0 if t0 is None else int((time.monotonic() - t0) * 1000)
+    return {"frames": frames_total, "wall_ms": wall_ms}
 
 
 def run(args: argparse.Namespace) -> int:
