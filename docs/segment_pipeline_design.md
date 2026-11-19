@@ -607,7 +607,7 @@ R3 只说"开始启动为空闲"。mic 上电 pop 音、首次噪声底噪未估
 
 ### G17 — 与 `speaker/pipeline` 的职责边界未界定【中】
 `docs/speaker_pipeline_design.md` 已定义 `IAudioPreprocessor`（分帧 + VAD + 语音段提取）与 `IASREngine`。本模块与它**功能重叠**。
-**补全**：明确分层——本 `segment` 模块是**实时双状态机（时间轴驱动，产出流式段）**；`IAudioPreprocessor.extract_speech_segments` 是**批式接口（整文件输入）**。二者共享帧级 VAD 与 `AudioSegment` DTO，但**不共享状态机**。落库时 `com/robot/segment/models.py` 复用 `pipeline/models.py` 的 `AudioFrame/AudioSegment`，避免两套数据结构漂移。
+**补全**：明确分层——本 `segment` 模块是**实时双状态机（时间轴驱动，产出流式段）**；`IAudioPreprocessor.extract_speech_segments` 是**批式接口（整文件输入）**。二者共享帧级 VAD 与 `AudioSegment` DTO，但**不共享状态机**。落库时 `com/robot/segment/models.py` 复用 `pipeline/models.py` 的 `AudioFrame/AudioSegment`，避免两套数据结构漂移。身份/声纹侧的边界（`to_bundle()` 的消费方）见 `docs/voiceprint_pipeline_design.md` §1.3。
 
 ### G18 — 单通道假设未声明，与多说话人流水线的衔接缺失【低】
 本状态机产出的是**混合音频段**（单通道）。若后续接 DOA/波束形成，段应是"每波束一路"，则状态机需实例化为 M 路。
